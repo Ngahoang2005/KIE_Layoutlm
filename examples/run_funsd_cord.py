@@ -8,16 +8,14 @@ from typing import Optional
 
 import numpy as np
 from datasets import ClassLabel, load_dataset
-import evaluate
 
 import transformers
-
+import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
 from transformers import (
     AutoConfig,
     AutoModelForTokenClassification,
     AutoTokenizer,
-    RobertaTokenizerFast,
     HfArgumentParser,
     PreTrainedTokenizerFast,
     Trainer,
@@ -143,6 +141,13 @@ class DataTrainingArguments:
     )
     segment_level_layout: bool = field(default=True)
     visual_embed: bool = field(default=True)
+    use_segment_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Use LayoutLMv3ForSegmentTokenClassification (segment-level pooling + "
+            "inter-segment context head) instead of the vanilla per-token classification head."
+        },
+    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -168,6 +173,18 @@ def main():
 
     # Detecting last checkpoint.
     last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
 
     # Setup logging
     logging.basicConfig(
@@ -193,11 +210,12 @@ def main():
     set_seed(training_args.seed)
 
     if data_args.dataset_name == 'funsd':
-        # Load trực tiếp dataset bản chuẩn từ HuggingFace
-        datasets = load_dataset("nielsr/funsd-layoutlmv3", cache_dir=model_args.cache_dir)
+        # datasets = load_dataset("nielsr/funsd")
+        import layoutlmft.data.funsd
+        datasets = load_dataset(os.path.abspath(layoutlmft.data.funsd.__file__), cache_dir=model_args.cache_dir)
     elif data_args.dataset_name == 'cord':
         import layoutlmft.data.cord
-        datasets = load_dataset(os.path.abspath(layoutlmft.data.cord.__file__), cache_dir=model_args.cache_dir, trust_remote_code=True)
+        datasets = load_dataset(os.path.abspath(layoutlmft.data.cord.__file__), cache_dir=model_args.cache_dir)
     else:
         raise NotImplementedError()
 
@@ -247,23 +265,40 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         input_size=data_args.input_size,
-        #use_auth_token=True if model_args.use_auth_token else None,
+        use_auth_token=True if model_args.use_auth_token else None,
     )
-    tokenizer = RobertaTokenizerFast.from_pretrained(
-        model_args.model_name_or_path,   # dùng đúng checkpoint LayoutLMv3, không hardcode "roberta-base"
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
         cache_dir=model_args.cache_dir,
+        use_fast=True,
         add_prefix_space=True,
         revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForTokenClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        #use_auth_token=True if model_args.use_auth_token else None,
-    )
-    model.to(training_args.device)
+    if getattr(data_args, "use_segment_head", False):
+        # NEW: segment-level pooling + inter-segment context head.
+        # See modeling_layoutlmv3_segment.py for the full design rationale.
+        from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
+    LayoutLMv3ForSegmentTokenClassification,
+)
+        model = LayoutLMv3ForSegmentTokenClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        model = AutoModelForTokenClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -287,7 +322,7 @@ def main():
             RandomResizedCropAndInterpolationWithTwoPic(
                 size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
-
+        import torch
         patch_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
@@ -309,43 +344,77 @@ def main():
         labels = []
         bboxes = []
         images = []
+        seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
 
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
+
+            # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
+            # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
+            # belonging to the same item, so grouping consecutive words with the
+            # same bbox tuple exactly reconstructs the gold segment groups --
+            # same trick used in the error-analysis script, no extra annotation
+            # needed.
+            # Only computed when --use_segment_head is set, so the baseline
+            # (vanilla LayoutLMv3ForTokenClassification, which has no `seg_id`
+            # argument in its forward()) never receives this extra batch key.
+            word_seg_id = None
+            if getattr(data_args, "use_segment_head", False):
+                word_seg_id = []
+                seg_counter = -1
+                prev_bbox_tuple = None
+                for wb in bbox:
+                    wb_tuple = tuple(wb)
+                    if wb_tuple != prev_bbox_tuple:
+                        seg_counter += 1
+                        prev_bbox_tuple = wb_tuple
+                    word_seg_id.append(seg_counter)
+
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
+            seg_id_inputs = []  # NEW
             for word_idx in word_ids:
                 # Special tokens have a word id that is None. We set the label to -100 so they are automatically
                 # ignored in the loss function.
                 if word_idx is None:
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(-1)  # NEW: not part of any segment
                 # We set the label for the first token of each word.
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
                 # For the other tokens in a word, we set the label to either the current label or -100, depending on
                 # the label_all_tokens flag.
                 else:
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
+            if word_seg_id is not None:
+                seg_ids.append(seg_id_inputs)  # NEW
 
             if data_args.visual_embed:
-                # Lấy trực tiếp object ảnh từ dataset và convert sang RGB
-                img = examples["image"][org_batch_index].convert("RGB")
+                ipath = examples["image_path"][org_batch_index]
+                img = pil_loader(ipath)
                 for_patches, _ = common_transform(img, augmentation=augmentation)
                 patch = patch_transform(for_patches)
                 images.append(patch)
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
+        if getattr(data_args, "use_segment_head", False):
+            tokenized_inputs["seg_id"] = seg_ids  # NEW
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -437,17 +506,48 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
+    import torch
+    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+    class CustomTrainer(Trainer):
+        def create_optimizer(self):
+            if self.optimizer is None:
+                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
+                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
+                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
+                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
 
-    # Initialize our Trainer
-    trainer = Trainer(
+                optimizer_grouped_parameters = [
+                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
+                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                ]
+                
+                self.optimizer = torch.optim.AdamW(
+                    optimizer_grouped_parameters, 
+                    betas=(self.args.adam_beta1, self.args.adam_beta2),
+                    eps=self.args.adam_epsilon,
+                )
+            return self.optimizer
+
+    # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
+    # Initialize our Trainer
+    # trainer = Trainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=data_collator,
+    #     compute_metrics=compute_metrics,
+    # )
 
     # Training
     if training_args.do_train:
