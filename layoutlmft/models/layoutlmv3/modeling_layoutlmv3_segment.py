@@ -58,25 +58,25 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_size,
-            nhead=seg_ctx_heads,
-            dim_feedforward=config.hidden_size * 2,
-            dropout=seg_ctx_dropout,
-            batch_first=True,
-        )
-        self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
-
-        # ReZero-style gate: starts at 0 so at step 0 the context module is a
-        # NO-OP (output == plain mean-pooled vector, i.e. identical to a
-        # "segment pooling only, no inter-segment context" ablation). Training
-        # then gradually learns how much of the (initially random) context
-        # transform to blend in. This avoids injecting a large random
-        # perturbation into a well-pretrained backbone's features right at
-        # the start of fine-tuning -- important on tiny datasets like FUNSD
-        # (149 docs) where a high-variance early gradient can permanently
-        # damage the pretrained representation.
-        self.segment_context_gate = nn.Parameter(torch.zeros(1))
+        if seg_ctx_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_size,
+                nhead=seg_ctx_heads,
+                dim_feedforward=config.hidden_size * 2,
+                dropout=seg_ctx_dropout,
+                batch_first=True,
+            )
+            self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
+            self.segment_context_gate = nn.Parameter(torch.zeros(1))
+            
+            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
+            max_pos = getattr(config, "segment_context_max_positions", 128)
+            self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
+            nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+        else:
+            self.segment_context = None
+            self.segment_context_gate = None
+            self.segment_position_embedding = None
 
         # Small embedding so the classifier can still tell "first token of the
         # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
@@ -127,12 +127,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
 
-            # The only place adjacent segments exchange information.
-            # Cheap: n_seg is typically tens, not hundreds, per document.
-            ctx_out = self.segment_context(seg_vecs.unsqueeze(0)).squeeze(0)  # (n_seg, H)
-            # ReZero blend: at init (gate=0) this reduces to seg_vecs_ctx == seg_vecs
-            # (pure mean-pooling, no context) -- see comment on self.segment_context_gate.
-            seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
+            if self.segment_context is not None:
+                max_pos = self.segment_position_embedding.num_embeddings
+                positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
+                seg_vecs_with_pos = seg_vecs + self.segment_position_embedding(positions)
+                ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
+                seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
+            else:
+                seg_vecs_ctx = seg_vecs
 
             for i, mask in enumerate(seg_masks):
                 broadcast_hidden[b, mask] = seg_vecs_ctx[i]
