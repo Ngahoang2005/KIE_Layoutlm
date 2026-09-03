@@ -40,6 +40,8 @@ class LayoutLMv3Config(BertConfig):
         use_hierarchical_position_encoding: bool = False,
         max_line_position: int = 50,
         max_block_position: int = 20,
+        use_segment_position_encoding: bool = False,
+        max_segment_position: int = 128,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -64,3 +66,5 @@ class LayoutLMv3Config(BertConfig):
         self.use_hierarchical_position_encoding = use_hierarchical_position_encoding
         self.max_line_position = max_line_position
         self.max_block_position = max_block_position
+        self.use_segment_position_encoding = use_segment_position_encoding
+        self.max_segment_position = max_segment_position
