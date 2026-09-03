@@ -101,7 +101,13 @@ class LayoutLMv3Embeddings(nn.Module):
         self.y_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
         self.h_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
         self.w_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
-
+        if getattr(config, "use_hierarchical_position_encoding", False):
+            self.line_position_embeddings = nn.Embedding(config.max_line_position, config.coordinate_size)
+            self.block_position_embeddings = nn.Embedding(config.max_block_position, config.coordinate_size)
+            self.hierarchical_proj = nn.Linear(config.coordinate_size * 2, config.hidden_size)
+        else:
+            self.line_position_embeddings = None
+            self.block_position_embeddings = None
     def _calc_spatial_position_embeddings(self, bbox):
         try:
             assert torch.all(0 <= bbox) and torch.all(bbox <= 1023)
@@ -183,6 +189,32 @@ class LayoutLMv3Embeddings(nn.Module):
 
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
+        if self.line_position_embeddings is not None and line_ids is not None and block_ids is not None:
+            if line_ids.dim() == 2 and line_ids.shape[1] != embeddings.shape[1]:
+                if line_ids.shape[1] > embeddings.shape[1]:
+                    line_ids = line_ids[:, :embeddings.shape[1]]
+                    block_ids = block_ids[:, :embeddings.shape[1]]
+                else:
+                    pad_len = embeddings.shape[1] - line_ids.shape[1]
+                    line_ids = torch.cat([line_ids, torch.ones(line_ids.shape[0], pad_len, device=line_ids.device, dtype=line_ids.dtype) * -1], dim=1)
+                    block_ids = torch.cat([block_ids, torch.ones(block_ids.shape[0], pad_len, device=block_ids.device, dtype=block_ids.dtype) * -1], dim=1)
+            
+            line_ids_clamped = torch.clamp(line_ids, 0, self.line_position_embeddings.num_embeddings - 1)
+            block_ids_clamped = torch.clamp(block_ids, 0, self.block_position_embeddings.num_embeddings - 1)
+            
+            line_emb = self.line_position_embeddings(line_ids_clamped)
+            block_emb = self.block_position_embeddings(block_ids_clamped)
+            hierarchical_emb = self.hierarchical_proj(torch.cat([line_emb, block_emb], dim=-1))
+            
+            if hierarchical_emb.shape[1] != embeddings.shape[1]:
+                if hierarchical_emb.shape[1] > embeddings.shape[1]:
+                    hierarchical_emb = hierarchical_emb[:, :embeddings.shape[1], :]
+                else:
+                    pad_len = embeddings.shape[1] - hierarchical_emb.shape[1]
+                    pad_zeros = torch.zeros(hierarchical_emb.shape[0], pad_len, hierarchical_emb.shape[2], device=hierarchical_emb.device)
+                    hierarchical_emb = torch.cat([hierarchical_emb, pad_zeros], dim=1)
+            
+            embeddings = embeddings + hierarchical_emb
         return embeddings
 
     def create_position_ids_from_inputs_embeds(self, inputs_embeds):
