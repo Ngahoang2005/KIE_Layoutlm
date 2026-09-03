@@ -37,6 +37,9 @@ class LayoutLMv3Config(BertConfig):
         input_size=224,
         second_input_size=112,
         device='cuda',
+        use_hierarchical_position_encoding: bool = False,
+        max_line_position: int = 50,
+        max_block_position: int = 20,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -58,3 +61,6 @@ class LayoutLMv3Config(BertConfig):
         self.input_size = input_size
         self.second_input_size = second_input_size
         self.device = device
+        self.use_hierarchical_position_encoding = use_hierarchical_position_encoding
+        self.max_line_position = max_line_position
+        self.max_block_position = max_block_position
