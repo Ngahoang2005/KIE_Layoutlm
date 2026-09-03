@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from datasets import ClassLabel, load_dataset
-import evaluate
+from datasets import ClassLabel, load_dataset, load_metric
+
 import transformers
 import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
@@ -65,6 +65,26 @@ class ModelArguments:
             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
             "with private models)."
         },
+    )
+    use_hierarchical_position_encoding: bool = field(
+        default=False,
+        metadata={"help": "Enable Hierarchical Position Encoding (HPE)"}
+    )
+    max_line_position: int = field(
+        default=50,
+        metadata={"help": "Maximum number of lines in a document for HPE"}
+    )
+    max_block_position: int = field(
+        default=20,
+        metadata={"help": "Maximum number of blocks in a document for HPE"}
+    )
+    use_segment_position_encoding: bool = field(
+        default=False,
+        metadata={"help": "Enable positional encoding for segments in inter-segment Transformer"}
+    )
+    max_segment_position: int = field(
+        default=128,
+        metadata={"help": "Maximum number of segments in a document for segment position encoding"}
     )
 
 
@@ -266,6 +286,11 @@ def main():
         revision=model_args.model_revision,
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
+        use_hierarchical_position_encoding=model_args.use_hierarchical_position_encoding,
+        max_line_position=model_args.max_line_position,
+        max_block_position=model_args.max_block_position,
+        use_segment_position_encoding=model_args.use_segment_position_encoding,
+        max_segment_position=model_args.max_segment_position,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -337,14 +362,53 @@ def main():
             padding=False,
             truncation=True,
             return_overflowing_tokens=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
         bboxes = []
         images = []
-        seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        seg_ids = []
+        line_ids_all = []    # NEW
+        block_ids_all = []   # NEW
+        
+        # Helper function để tính line_ids từ bbox
+        def compute_line_ids(bboxes, y_threshold=10):
+            """Gom các token có y_center gần nhau thành cùng 1 dòng"""
+            if not bboxes:
+                return []
+            # Tính y_center của mỗi bbox
+            y_centers = [(box[1] + box[3]) / 2 for box in bboxes]
+            # Sắp xếp và gom cụm
+            lines = []
+            current_line = 0
+            lines.append(current_line)
+            for i in range(1, len(y_centers)):
+                if abs(y_centers[i] - y_centers[i-1]) > y_threshold:
+                    current_line += 1
+                lines.append(current_line)
+            return lines
+        
+        # Helper function để tính block_ids từ bbox
+        def compute_block_ids(bboxes, x_threshold=50, y_threshold=30):
+            """Gom các token gần nhau thành cùng 1 block (dựa trên khoảng cách XY)"""
+            if not bboxes:
+                return []
+            # Tính center của mỗi bbox
+            centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in bboxes]
+            # Gán block ID đơn giản: các token có khoảng cách <= threshold
+            blocks = []
+            current_block = 0
+            blocks.append(current_block)
+            for i in range(1, len(centers)):
+                # Tính khoảng cách từ token hiện tại đến token trước
+                dx = centers[i][0] - centers[i-1][0]
+                dy = centers[i][1] - centers[i-1][1]
+                if abs(dx) > x_threshold or abs(dy) > y_threshold:
+                    current_block += 1
+                blocks.append(current_block)
+            return blocks
+        
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -352,15 +416,11 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
-            # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
-            # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
-            # belonging to the same item, so grouping consecutive words with the
-            # same bbox tuple exactly reconstructs the gold segment groups --
-            # same trick used in the error-analysis script, no extra annotation
-            # needed.
-            # Only computed when --use_segment_head is set, so the baseline
-            # (vanilla LayoutLMv3ForTokenClassification, which has no `seg_id`
-            # argument in its forward()) never receives this extra batch key.
+            # NEW: Tính line_ids và block_ids cho các token gốc
+            line_ids_orig = compute_line_ids(bbox)
+            block_ids_orig = compute_block_ids(bbox)
+
+            # NEW: recover segment boundaries (giữ nguyên code cũ)
             word_seg_id = None
             if getattr(data_args, "use_segment_head", False):
                 word_seg_id = []
@@ -376,33 +436,43 @@ def main():
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []  # NEW
+            seg_id_inputs = []
+            line_ids_aligned = []    # NEW
+            block_ids_aligned = []   # NEW
+            
             for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
                 if word_idx is None:
+                    # Special tokens
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(-1)  # NEW: not part of any segment
-                # We set the label for the first token of each word.
+                        seg_id_inputs.append(-1)
+                    line_ids_aligned.append(-1)     # NEW
+                    block_ids_aligned.append(-1)    # NEW
                 elif word_idx != previous_word_idx:
+                    # First token of a word
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
+                        seg_id_inputs.append(word_seg_id[word_idx])
+                    line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
+                    block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
                 else:
+                    # Subsequent tokens of the same word
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                        seg_id_inputs.append(word_seg_id[word_idx])
+                    line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
+                    block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
                 previous_word_idx = word_idx
+                
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)  # NEW
+                seg_ids.append(seg_id_inputs)
+            line_ids_all.append(line_ids_aligned)     # NEW
+            block_ids_all.append(block_ids_aligned)   # NEW
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -413,8 +483,11 @@ def main():
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
+        tokenized_inputs["line_ids"] = line_ids_all    # NEW
+        tokenized_inputs["block_ids"] = block_ids_all  # NEW
+        
         if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids  # NEW
+            tokenized_inputs["seg_id"] = seg_ids
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -433,6 +506,7 @@ def main():
             num_proc=data_args.preprocessing_num_workers,
             load_from_cache_file=not data_args.overwrite_cache,
         )
+        
 
     if training_args.do_eval:
         validation_name = "test"
@@ -470,9 +544,48 @@ def main():
         padding=padding,
         max_length=512,
     )
+    # ====== KIỂM TRA BATCH DATA ======
+    # Tạo data collator và dataloader để kiểm tra
+    from torch.utils.data import DataLoader
+    temp_dataloader = DataLoader(
+        train_dataset,
+        batch_size=2,
+        collate_fn=data_collator,
+        shuffle=False
+    )
+    
+    # Lấy 1 batch
+    batch = next(iter(temp_dataloader))
+    
+    # Kiểm tra các keys trong batch
+    print("=" * 50)
+    print("KEYS IN BATCH:", batch.keys())
+    print("=" * 50)
+    
+    # Kiểm tra line_ids và block_ids có tồn tại không
+    if "line_ids" in batch:
+        print(f"✅ line_ids shape: {batch['line_ids'].shape}")
+        print(f"   line_ids sample: {batch['line_ids'][0][:10]}")  # 10 token đầu
+    else:
+        print("❌ line_ids NOT FOUND in batch!")
+    
+    if "block_ids" in batch:
+        print(f"✅ block_ids shape: {batch['block_ids'].shape}")
+        print(f"   block_ids sample: {batch['block_ids'][0][:10]}")
+    else:
+        print("❌ block_ids NOT FOUND in batch!")
+    
+    # Kiểm tra seg_id có bị xóa không
+    if "seg_id" in batch:
+        print(f"✅ seg_id shape: {batch['seg_id'].shape}")
+    else:
+        print("⚠️ seg_id NOT FOUND (có thể bị xóa trong data_collator)")
+    
+    print("=" * 50)
+    # ====== KẾT THÚC KIỂM TRA ======
 
     # Metrics
-    metric = evaluate.load("seqeval")
+    metric = load_metric("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
