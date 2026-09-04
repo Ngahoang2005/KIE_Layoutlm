@@ -78,15 +78,14 @@ class ModelArguments:
         default=20,
         metadata={"help": "Maximum number of blocks in a document for HPE"}
     )
-    use_segment_position_encoding: bool = field(
-        default=False,
-        metadata={"help": "Enable positional encoding for segments in inter-segment Transformer"}
-    )
-    max_segment_position: int = field(
-        default=128,
-        metadata={"help": "Maximum number of segments in a document for segment position encoding"}
-    )
-
+    segment_context_max_positions: int = field(
+    default=128,
+    metadata={
+        "help": "Maximum number of segments in a document for the segment-position "
+        "embedding used inside the inter-segment context module (always active "
+        "whenever segment_context_layers > 0, no separate toggle)."
+    },
+)
 
 @dataclass
 class DataTrainingArguments:
@@ -279,19 +278,18 @@ def main():
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
     config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=num_labels,
-        finetuning_task=data_args.task_name,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        input_size=data_args.input_size,
-        use_auth_token=True if model_args.use_auth_token else None,
-        use_hierarchical_position_encoding=model_args.use_hierarchical_position_encoding,
-        max_line_position=model_args.max_line_position,
-        max_block_position=model_args.max_block_position,
-        use_segment_position_encoding=model_args.use_segment_position_encoding,
-        max_segment_position=model_args.max_segment_position,
-    )
+    model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+    num_labels=num_labels,
+    finetuning_task=data_args.task_name,
+    cache_dir=model_args.cache_dir,
+    revision=model_args.model_revision,
+    input_size=data_args.input_size,
+    use_auth_token=True if model_args.use_auth_token else None,
+    use_hierarchical_position_encoding=model_args.use_hierarchical_position_encoding,
+    max_line_position=model_args.max_line_position,
+    max_block_position=model_args.max_block_position,
+    segment_context_max_positions=model_args.segment_context_max_positions,
+)
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
