@@ -37,6 +37,7 @@ class LayoutLMv3Config(BertConfig):
         input_size=224,
         second_input_size=112,
         device='cuda',
+        use_dual_stream: bool = True,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -58,3 +59,4 @@ class LayoutLMv3Config(BertConfig):
         self.input_size = input_size
         self.second_input_size = second_input_size
         self.device = device
+        self.use_dual_stream = use_dual_stream
