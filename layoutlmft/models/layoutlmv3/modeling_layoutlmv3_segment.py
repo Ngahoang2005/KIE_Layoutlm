@@ -86,27 +86,22 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
+          # ====== NEW: Token-level gated residual fusion (thay cho hard broadcast) ======
+        self.use_token_gated_fusion = getattr(config, "use_token_gated_fusion", True)
+        if self.use_token_gated_fusion:
+            # input: [token_hidden ; delta] -> concat 2H -> gate per-channel (H,)
+            self.fusion_gate_mlp = nn.Sequential(
+                nn.Linear(config.hidden_size * 2, config.hidden_size),
+                nn.Tanh(),
+                nn.Linear(config.hidden_size, config.hidden_size),
+            )
+            # init để gate ~ 0 lúc đầu (giống tinh thần ReZero) -> ban đầu gần baseline
+            nn.init.zeros_(self.fusion_gate_mlp[-1].weight)
+            nn.init.constant_(self.fusion_gate_mlp[-1].bias, -4.0)  # sigmoid(-4) ~ 0.018, gần 0
+
         self.init_weights()
-        # for param in self.layoutlmv3.parameters():
-        #     param.requires_grad = False
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
-        """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
-        seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
-                     to any segment (special tokens / padding). Non-negative
-                     values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
-
-        Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
-        """
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
@@ -117,7 +112,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if valid.sum() == 0:
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
+            uniq_segs = torch.unique(ids[valid], sorted=True)
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
@@ -136,11 +131,22 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 seg_vecs_ctx = seg_vecs
 
+            # ====== NEW: fusion thay cho gán cứng ======
             for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+                delta = seg_vecs_ctx[i] - seg_vecs[i]          # phần thông tin MỚI học từ láng giềng
+                token_hidden_in_seg = text_hidden[b, mask]      # (n_tok, H) - giữ nguyên đặc trưng riêng
 
-        return broadcast_hidden
+                if self.use_token_gated_fusion:
+                    n_tok = token_hidden_in_seg.shape[0]
+                    delta_expand = delta.unsqueeze(0).expand(n_tok, -1)          # (n_tok, H)
+                    gate_input = torch.cat([token_hidden_in_seg, delta_expand], dim=-1)  # (n_tok, 2H)
+                    token_gate = torch.sigmoid(self.fusion_gate_mlp(gate_input))          # (n_tok, H)
+                    broadcast_hidden[b, mask] = token_hidden_in_seg + token_gate * delta_expand
+                else:
+                    # baseline cũ, giữ để ablate on/off dễ dàng
+                    broadcast_hidden[b, mask] = seg_vecs_ctx[i]
 
+        return broadcast_hidden    
     def forward(
         self,
         input_ids=None,

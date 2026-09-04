@@ -66,6 +66,10 @@ class ModelArguments:
             "with private models)."
         },
     )
+    use_token_gated_fusion: bool = field(
+    default=True,
+    metadata={"help": "Use per-token gated residual fusion instead of hard segment broadcast."}
+)
 
 
 @dataclass
@@ -266,6 +270,7 @@ def main():
         revision=model_args.model_revision,
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
+        use_token_gated_fusion=model_args.use_token_gated_fusion,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
