@@ -1,20 +1,14 @@
 # coding=utf-8
 from transformers.models.bert.configuration_bert import BertConfig
 from transformers.utils import logging
-
-
 logger = logging.get_logger(__name__)
-
 LAYOUTLMV3_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "layoutlmv3-base": "https://huggingface.co/microsoft/layoutlmv3-base/resolve/main/config.json",
     "layoutlmv3-large": "https://huggingface.co/microsoft/layoutlmv3-large/resolve/main/config.json",
     # See all LayoutLMv3 models at https://huggingface.co/models?filter=layoutlmv3
 }
-
-
 class LayoutLMv3Config(BertConfig):
     model_type = "layoutlmv3"
-
     def __init__(
         self,
         pad_token_id=1,
@@ -40,8 +34,11 @@ class LayoutLMv3Config(BertConfig):
         use_hierarchical_position_encoding: bool = False,
         max_line_position: int = 50,
         max_block_position: int = 20,
-        use_segment_position_encoding: bool = False,
-        max_segment_position: int = 128,
+        # ---- Segment position encoding: KHÔNG còn cờ bật/tắt riêng.
+        # Luôn active (gắn liền với inter-segment context module trong
+        # modeling_layoutlmv3_segment.py). Chỉ còn 1 tham số duy nhất
+        # kiểm soát số lượng segment tối đa, đặt tên khớp với module đó.
+        segment_context_max_positions: int = 128,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -66,5 +63,4 @@ class LayoutLMv3Config(BertConfig):
         self.use_hierarchical_position_encoding = use_hierarchical_position_encoding
         self.max_line_position = max_line_position
         self.max_block_position = max_block_position
-        self.use_segment_position_encoding = use_segment_position_encoding
-        self.max_segment_position = max_segment_position
+        self.segment_context_max_positions = segment_context_max_positions
