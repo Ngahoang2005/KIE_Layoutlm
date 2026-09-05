@@ -81,7 +81,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.film_gamma = nn.Linear(config.hidden_size, config.hidden_size)
             self.film_beta = nn.Linear(config.hidden_size, config.hidden_size)
             nn.init.zeros_(self.film_gamma.weight)
-            nn.init.ones_(self.film_gamma.bias)
+            nn.init.zeros_(self.film_gamma.bias)
             nn.init.zeros_(self.film_beta.weight)
             nn.init.zeros_(self.film_beta.bias)
         else:
@@ -155,6 +155,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 if self.film_gamma is not None:
                     seg_ctx = seg_vecs_ctx[i]                        # (H,)
                     gamma = self.film_gamma(seg_ctx)                 # (H,)
+                    gamma = 1.0 + 0.1 * torch.tanh(gamma_raw)  
                     beta = self.film_beta(seg_ctx)                   # (H,)
                     broadcast_hidden[b, mask] = gamma * token_hidden_in_seg + beta
                 else:
