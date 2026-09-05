@@ -154,7 +154,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     seg_ctx = seg_vecs_ctx[i]
                     gamma_raw = self.film_gamma(seg_ctx)
                     gamma = 1.0 + 0.1 * torch.tanh(gamma_raw)
-                    beta = self.film_beta(seg_ctx)
+                    beta_raw = self.film_beta(seg_ctx)
+                    beta = 0.1 * torch.tanh(beta_raw)
                     broadcast_hidden[b, mask] = gamma * token_hidden_in_seg + beta
                 else:
                     broadcast_hidden[b, mask] = seg_vecs_ctx[i]
