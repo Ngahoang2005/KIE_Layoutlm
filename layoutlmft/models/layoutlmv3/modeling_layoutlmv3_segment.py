@@ -148,19 +148,15 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 seg_vecs_ctx = seg_vecs
 
-            # ====== FiLM fusion: giữ đặc trưng RIÊNG từng token, chỉ "nhuộm"
-            # thêm ngữ cảnh segment theo gamma/beta -- KHÔNG gán cứng như trước ======
             for i, mask in enumerate(seg_masks):
-                token_hidden_in_seg = text_hidden[b, mask]          # (n_tok, H) - giữ nguyên đặc trưng riêng
+                token_hidden_in_seg = text_hidden[b, mask]
                 if self.film_gamma is not None:
-                    seg_ctx = seg_vecs_ctx[i]                        # (H,)
-                    gamma = self.film_gamma(seg_ctx)                 # (H,)
-                    gamma = 1.0 + 0.1 * torch.tanh(gamma_raw)  
-                    beta = self.film_beta(seg_ctx)                   # (H,)
+                    seg_ctx = seg_vecs_ctx[i]
+                    gamma_raw = self.film_gamma(seg_ctx)
+                    gamma = 1.0 + 0.1 * torch.tanh(gamma_raw)
+                    beta = self.film_beta(seg_ctx)
                     broadcast_hidden[b, mask] = gamma * token_hidden_in_seg + beta
                 else:
-                    # segment_context_layers == 0 (pooling-only ablation, không có FiLM
-                    # vì không tạo film_gamma/beta) -> giữ hành vi cũ: gán bằng seg_vecs_ctx.
                     broadcast_hidden[b, mask] = seg_vecs_ctx[i]
         return broadcast_hidden
 
