@@ -52,8 +52,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # ---- NEW: lightweight inter-segment context module ----
-        # Config knobs (optional; safe defaults if not set on the config object).
+        # ---- Inter-segment context (unchanged) ----
         seg_ctx_layers = getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
@@ -68,8 +67,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
-            
-            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
+
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
@@ -78,35 +76,27 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_context_gate = None
             self.segment_position_embedding = None
 
-        # Small embedding so the classifier can still tell "first token of the
-        # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
-        # even though every token in the segment otherwise shares one pooled
-        # vector. Initialized near zero so early training resembles the
-        # unmodified baseline.
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        use_token_fusion = getattr(config, "use_token_fusion", True)
+        self.use_token_fusion = use_token_fusion
+        if use_token_fusion:
+            self.local_classifier = nn.Linear(config.hidden_size, config.num_labels)
+            gate_hidden_dim = getattr(config, "token_fusion_gate_hidden_dim", config.hidden_size // 4)
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(config.hidden_size * 2 + 2, gate_hidden_dim),
+                nn.GELU(),
+                nn.Linear(gate_hidden_dim, 1),
+            )
+            nn.init.zeros_(self.fusion_gate[-1].weight)
+            nn.init.constant_(self.fusion_gate[-1].bias, -4.0) 
+        else:
+            self.local_classifier = None
+            self.fusion_gate = None
 
         self.init_weights()
-        # for param in self.layoutlmv3.parameters():
-        #     param.requires_grad = False
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
-        """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
-        seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
-                     to any segment (special tokens / padding). Non-negative
-                     values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
-
-        Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
-        """
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
@@ -117,7 +107,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if valid.sum() == 0:
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
+            uniq_segs = torch.unique(ids[valid], sorted=True)
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
@@ -152,7 +142,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        seg_id=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -175,37 +165,60 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             valid_span=valid_span,
         )
 
-        sequence_output = outputs[0]  # (B, text_len + image_len, H)
+        sequence_output = outputs[0]
         text_len = input_ids.shape[1]
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
-        if seg_id is not None:
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+        local_hidden = text_hidden
 
-            # Add the is-first-token-of-segment signal so the classifier can
-            # still distinguish B- from I- despite the shared pooled vector.
+        if seg_id is not None:
+            broadcast_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+
             is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
+            is_first[:, 0] = 0
             if seg_id.shape[1] > 1:
                 prev = seg_id[:, :-1]
                 cur = seg_id[:, 1:]
                 changed = (cur != prev) & (cur >= 0)
                 is_first[:, 1:] = changed.long()
-            # A token whose seg_id == -1 (special/pad) is never "first of a segment".
             is_first = is_first * (seg_id >= 0).long()
 
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
-        # if seg_id is None (e.g. an old checkpoint / different dataloader),
-        # fall back to plain per-token behavior -- text_hidden is untouched.
+            broadcast_hidden = broadcast_hidden + self.is_first_token_embedding(is_first)
+        else:
+            broadcast_hidden = text_hidden
 
         if image_hidden.shape[1] > 0:
-            pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
+            pooled_sequence = torch.cat([broadcast_hidden, image_hidden], dim=1)
         else:
-            pooled_sequence = text_hidden
+            pooled_sequence = broadcast_hidden
 
         pooled_sequence = self.dropout(pooled_sequence)
-        logits = self.classifier(pooled_sequence)
+        segment_logits_full = self.classifier(pooled_sequence)  
+
+        if self.use_token_fusion and seg_id is not None:
+            segment_logits_text = segment_logits_full[:, :text_len, :]
+
+            local_logits = self.local_classifier(self.dropout(local_hidden)) 
+
+            with torch.no_grad():
+                seg_probs = torch.softmax(segment_logits_text, dim=-1)
+                max_prob = seg_probs.max(dim=-1, keepdim=True).values     
+                entropy = -(seg_probs * torch.log(seg_probs.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
+
+            gate_input = torch.cat(
+                [local_hidden, broadcast_hidden, max_prob, entropy], dim=-1
+            )  # (B, text_len, 2H+2)
+            gate = torch.sigmoid(self.fusion_gate(gate_input)) 
+
+            fused_text_logits = (1.0 - gate) * segment_logits_text + gate * local_logits
+
+            if image_hidden.shape[1] > 0:
+                logits = torch.cat([fused_text_logits, segment_logits_full[:, text_len:, :]], dim=1)
+            else:
+                logits = fused_text_logits
+        else:
+            logits = segment_logits_full
 
         loss = None
         if labels is not None:
