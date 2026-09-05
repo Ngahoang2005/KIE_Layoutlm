@@ -26,6 +26,7 @@ do
       --do_eval \
       --do_predict \
       --use_segment_head \
+      --use_dual_stream True \
       --model_name_or_path models/layoutlmv3-base \
       --output_dir "$OUT_DIR" \
       --segment_level_layout 1 \

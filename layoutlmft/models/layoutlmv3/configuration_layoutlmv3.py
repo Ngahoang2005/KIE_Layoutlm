@@ -38,6 +38,7 @@ class LayoutLMv3Config(BertConfig):
         second_input_size=112,
         device='cuda',
         use_dual_stream: bool = True,
+        use_token_gated_fusion: bool = False,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -60,3 +61,4 @@ class LayoutLMv3Config(BertConfig):
         self.second_input_size = second_input_size
         self.device = device
         self.use_dual_stream = use_dual_stream
+        self.use_token_gated_fusion = use_token_gated_fusion

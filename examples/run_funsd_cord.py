@@ -9,6 +9,7 @@ from typing import Optional
 import numpy as np
 from datasets import ClassLabel, load_dataset
 import evaluate
+
 import transformers
 import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
@@ -65,6 +66,14 @@ class ModelArguments:
             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
             "with private models)."
         },
+    )
+    use_dual_stream: bool = field(
+    default=False,
+    metadata={"help": "Use dual-stream (token-level + segment-context) classifier heads fused at logits, instead of hard broadcast."}
+)
+    use_token_gated_fusion: bool = field(
+        default=False,
+        metadata={"help": "Use per-token gated residual fusion instead of hard segment broadcast (only used when dual-stream is off)."}
     )
 
 
@@ -266,6 +275,8 @@ def main():
         revision=model_args.model_revision,
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
+        use_dual_stream=model_args.use_dual_stream,
+        use_token_gated_fusion=model_args.use_token_gated_fusion,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
