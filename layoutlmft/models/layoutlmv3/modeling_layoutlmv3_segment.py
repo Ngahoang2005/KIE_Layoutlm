@@ -84,6 +84,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             nn.init.zeros_(self.film_gamma.bias)
             nn.init.zeros_(self.film_beta.weight)
             nn.init.zeros_(self.film_beta.bias)
+            self.film_output_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
             self.segment_context = None
             self.segment_context_gate = None
