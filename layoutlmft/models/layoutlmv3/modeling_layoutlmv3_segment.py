@@ -73,10 +73,23 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+            # NEW: FiLM fusion -- inject segment context per-token instead of
+            # broadcasting one identical vector to every token in the segment.
+            # gamma khởi tạo = 1, beta khởi tạo = 0 -> lúc bước 0, token_moi =
+            # token_goc HOÀN TOÀN (an toàn tuyệt đối, giống hệt ReZero gate ở
+            # trên nhưng áp dụng per-token thay vì 1 scalar toàn cục).
+            self.film_gamma = nn.Linear(config.hidden_size, config.hidden_size)
+            self.film_beta = nn.Linear(config.hidden_size, config.hidden_size)
+            nn.init.zeros_(self.film_gamma.weight)
+            nn.init.ones_(self.film_gamma.bias)
+            nn.init.zeros_(self.film_beta.weight)
+            nn.init.zeros_(self.film_beta.bias)
         else:
             self.segment_context = None
             self.segment_context_gate = None
             self.segment_position_embedding = None
+            self.film_gamma = None
+            self.film_beta = None
 
         # Small embedding so the classifier can still tell "first token of the
         # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
@@ -126,7 +139,6 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 mask = ids == s
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
-
             if self.segment_context is not None:
                 max_pos = self.segment_position_embedding.num_embeddings
                 positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
@@ -136,9 +148,19 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 seg_vecs_ctx = seg_vecs
 
+            # ====== FiLM fusion: giữ đặc trưng RIÊNG từng token, chỉ "nhuộm"
+            # thêm ngữ cảnh segment theo gamma/beta -- KHÔNG gán cứng như trước ======
             for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
-
+                token_hidden_in_seg = text_hidden[b, mask]          # (n_tok, H) - giữ nguyên đặc trưng riêng
+                if self.film_gamma is not None:
+                    seg_ctx = seg_vecs_ctx[i]                        # (H,)
+                    gamma = self.film_gamma(seg_ctx)                 # (H,)
+                    beta = self.film_beta(seg_ctx)                   # (H,)
+                    broadcast_hidden[b, mask] = gamma * token_hidden_in_seg + beta
+                else:
+                    # segment_context_layers == 0 (pooling-only ablation, không có FiLM
+                    # vì không tạo film_gamma/beta) -> giữ hành vi cũ: gán bằng seg_vecs_ctx.
+                    broadcast_hidden[b, mask] = seg_vecs_ctx[i]
         return broadcast_hidden
 
     def forward(
