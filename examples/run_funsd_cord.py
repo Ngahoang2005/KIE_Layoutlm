@@ -159,14 +159,8 @@ class DataTrainingArguments:
 
 
 def main():
-    # See all possible arguments in layoutlmft/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -194,23 +188,19 @@ def main():
     )
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
-    # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
-    # Set the verbosity to info of the Transformers logger (on main process only):
     if is_main_process(training_args.local_rank):
         transformers.utils.logging.set_verbosity_info()
         transformers.utils.logging.enable_default_handler()
         transformers.utils.logging.enable_explicit_format()
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Set seed before initializing model.
     set_seed(training_args.seed)
 
     if data_args.dataset_name == 'funsd':
-        # datasets = load_dataset("nielsr/funsd")
         import layoutlmft.data.funsd
         datasets = load_dataset(os.path.abspath(layoutlmft.data.funsd.__file__), cache_dir=model_args.cache_dir)
     elif data_args.dataset_name == 'cord':
@@ -234,8 +224,6 @@ def main():
 
     remove_columns = column_names
 
-    # In the event the labels are not a `Sequence[ClassLabel]`, we will need to go through the dataset to get the
-    # unique labels.
     def get_label_list(labels):
         unique_labels = set()
         for label in labels:
@@ -246,18 +234,12 @@ def main():
 
     if isinstance(features[label_column_name].feature, ClassLabel):
         label_list = features[label_column_name].feature.names
-        # No need to convert the labels since they are already ints.
         label_to_id = {i: i for i in range(len(label_list))}
     else:
         label_list = get_label_list(datasets["train"][label_column_name])
         label_to_id = {l: i for i, l in enumerate(label_list)}
     num_labels = len(label_list)
 
-    # Load pretrained model and tokenizer
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -269,7 +251,7 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
+        tokenizer_file=None,
         cache_dir=model_args.cache_dir,
         use_fast=True,
         add_prefix_space=True,
@@ -277,11 +259,9 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
     if getattr(data_args, "use_segment_head", False):
-        # NEW: segment-level pooling + inter-segment context head.
-        # See modeling_layoutlmv3_segment.py for the full design rationale.
         from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
-    LayoutLMv3ForSegmentTokenClassification,
-)
+            LayoutLMv3ForSegmentTokenClassification,
+        )
         model = LayoutLMv3ForSegmentTokenClassification.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -300,7 +280,6 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
-    # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         raise ValueError(
             "This example script only works for models that have a fast tokenizer. Checkout the big table of models "
@@ -308,8 +287,6 @@ def main():
             "requirement"
         )
 
-    # Preprocessing the dataset
-    # Padding strategy
     padding = "max_length" if data_args.pad_to_max_length else False
 
     if data_args.visual_embed:
@@ -317,8 +294,6 @@ def main():
         mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN
         std = IMAGENET_INCEPTION_STD if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_STD
         common_transform = Compose([
-            # transforms.ColorJitter(0.4, 0.4, 0.4),
-            # transforms.RandomHorizontalFlip(p=0.5),
             RandomResizedCropAndInterpolationWithTwoPic(
                 size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
@@ -330,21 +305,19 @@ def main():
                 std=torch.tensor(std))
         ])
 
-    # Tokenize all texts and align the labels with them.
     def tokenize_and_align_labels(examples, augmentation=False):
         tokenized_inputs = tokenizer(
             examples[text_column_name],
             padding=False,
             truncation=True,
             return_overflowing_tokens=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
         bboxes = []
         images = []
-        seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        seg_ids = []
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -352,15 +325,6 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
-            # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
-            # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
-            # belonging to the same item, so grouping consecutive words with the
-            # same bbox tuple exactly reconstructs the gold segment groups --
-            # same trick used in the error-analysis script, no extra annotation
-            # needed.
-            # Only computed when --use_segment_head is set, so the baseline
-            # (vanilla LayoutLMv3ForTokenClassification, which has no `seg_id`
-            # argument in its forward()) never receives this extra batch key.
             word_seg_id = None
             if getattr(data_args, "use_segment_head", False):
                 word_seg_id = []
@@ -376,33 +340,28 @@ def main():
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []  # NEW
+            seg_id_inputs = []
             for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
                 if word_idx is None:
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(-1)  # NEW: not part of any segment
-                # We set the label for the first token of each word.
+                        seg_id_inputs.append(-1)
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
+                        seg_id_inputs.append(word_seg_id[word_idx])
                 else:
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                        seg_id_inputs.append(word_seg_id[word_idx])
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)  # NEW
+                seg_ids.append(seg_id_inputs)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -414,7 +373,7 @@ def main():
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids  # NEW
+            tokenized_inputs["seg_id"] = seg_ids
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -463,7 +422,6 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
-    # Data collator
     data_collator = DataCollatorForKeyValueExtraction(
         tokenizer,
         pad_to_multiple_of=8 if training_args.fp16 else None,
@@ -471,14 +429,12 @@ def main():
         max_length=512,
     )
 
-    # Metrics
     metric = evaluate.load("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
         predictions = np.argmax(predictions, axis=2)
 
-        # Remove ignored index (special tokens)
         true_predictions = [
             [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
             for prediction, label in zip(predictions, labels)
@@ -490,7 +446,6 @@ def main():
 
         results = metric.compute(predictions=true_predictions, references=true_labels)
         if data_args.return_entity_level_metrics:
-            # Unpack nested dictionaries
             final_results = {}
             for key, value in results.items():
                 if isinstance(value, dict):
@@ -506,29 +461,56 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
+
     import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+
+    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate + tự log avg_gate
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                # Nhóm 1: backbone LayoutLMv3
+                backbone_params = [
+                    p for n, p in self.model.named_parameters()
+                    if "layoutlmv3" in n and p.requires_grad
+                ]
+                # Nhóm 2: fusion_gate riêng -- LR thấp hơn, để gate mở từ từ,
+                # tránh mở trước khi local_classifier đủ tin cậy.
+                gate_params = [
+                    p for n, p in self.model.named_parameters()
+                    if "fusion_gate" in n and p.requires_grad
+                ]
+                # Nhóm 3: mọi param mới còn lại (segment_context, classifier,
+                # is_first_token_embedding, local_classifier, ...)
+                other_new_params = [
+                    p for n, p in self.model.named_parameters()
+                    if "layoutlmv3" not in n and "fusion_gate" not in n and p.requires_grad
+                ]
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": backbone_params, "lr": self.args.learning_rate},
+                    {"params": other_new_params, "lr": 5e-4},
+                    {"params": gate_params, "lr": 1e-4},
                 ]
-                
+
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
 
-    # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
+        def evaluate(self, *args, **kwargs):
+            metrics = super().evaluate(*args, **kwargs)
+            # Tự động in + log avg_gate sau MỖI lần eval, không cần nhớ gọi tay.
+            model_for_stats = self.model
+            if hasattr(model_for_stats, "get_and_reset_gate_stats"):
+                avg_gate, n_tokens = model_for_stats.get_and_reset_gate_stats()
+                if avg_gate is not None:
+                    logger.info(f"[token-fusion] avg_gate = {avg_gate:.4f} (over {n_tokens} tokens)")
+                    metrics["eval_avg_fusion_gate"] = avg_gate
+                    self.log({"eval_avg_fusion_gate": avg_gate})
+            return metrics
+
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -538,23 +520,13 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-    # Initialize our Trainer
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     tokenizer=tokenizer,
-    #     data_collator=data_collator,
-    #     compute_metrics=compute_metrics,
-    # )
 
     # Training
     if training_args.do_train:
         checkpoint = last_checkpoint if last_checkpoint else None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        trainer.save_model()
 
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
@@ -584,7 +556,6 @@ def main():
         predictions, labels, metrics = trainer.predict(test_dataset)
         predictions = np.argmax(predictions, axis=2)
 
-        # Remove ignored index (special tokens)
         true_predictions = [
             [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
             for prediction, label in zip(predictions, labels)
@@ -593,7 +564,6 @@ def main():
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
-        # Save predictions
         output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
         if trainer.is_world_process_zero():
             with open(output_test_predictions_file, "w") as writer:
@@ -602,7 +572,6 @@ def main():
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
     main()
 
 
