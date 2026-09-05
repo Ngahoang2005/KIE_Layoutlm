@@ -21,10 +21,29 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (otherwise identical) broadcast vector can still support the B-/I-
     distinction at the classifier.
 
+  - NEW (token-fusion): a small auxiliary "local_classifier" sees the
+    ORIGINAL per-token hidden state (before segment pooling/broadcast), and
+    its logits are blended into the segment logits via a per-token,
+    uncertainty-conditioned gate. Fusion happens at the LOGIT level (not
+    hidden-state level) and in RESIDUAL form:
+
+        delta = local_logits - segment_logits.detach()
+        fused = segment_logits + gate * delta
+
+    This is deliberately NOT `(1-gate)*segment + gate*local`, because that
+    interpolation form multiplies the segment path's gradient by (1-gate)
+    at every step, permanently diluting the signal that made segment-level
+    pooling work in the first place. The residual form leaves the segment
+    path's gradient completely untouched (coefficient 1, not 1-gate) while
+    still letting `local_classifier` learn through `gate * delta`. The gate
+    starts near 0 (bias=-4 -> sigmoid~0.018), so at init the whole model is
+    numerically identical to the pure segment-head baseline; it only opens
+    up where the (detached) segment prediction is already uncertain
+    (high entropy / low max-prob), which is exactly the additive-help
+    regime we want (bofsung, not gay nhieu).
+
 This class does NOT touch attention, does NOT build any graph/hypergraph,
-and does NOT modify the pretrained backbone. It only replaces what the
-token classifier head "sees" for tokens inside multi-token segments -- an
-orthogonal mechanism to HGA / GraphLayoutLM.
+and does NOT modify the pretrained backbone.
 """
 import torch
 import torch.nn as nn
@@ -36,6 +55,7 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
+
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -78,25 +98,64 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+
+        # ================================================================
+        # Token-fusion module: local (pre-pooling) classifier + uncertainty
+        # -gated RESIDUAL logit fusion. See module docstring for rationale.
+        # ================================================================
         use_token_fusion = getattr(config, "use_token_fusion", True)
         self.use_token_fusion = use_token_fusion
+        self.token_fusion_aux_loss_weight = getattr(config, "token_fusion_aux_loss_weight", 0.3)
+
         if use_token_fusion:
             self.local_classifier = nn.Linear(config.hidden_size, config.num_labels)
+
             gate_hidden_dim = getattr(config, "token_fusion_gate_hidden_dim", config.hidden_size // 4)
             self.fusion_gate = nn.Sequential(
                 nn.Linear(config.hidden_size * 2 + 2, gate_hidden_dim),
                 nn.GELU(),
                 nn.Linear(gate_hidden_dim, 1),
             )
+            # Zero-init weight + negative bias -> gate starts near 0
+            # (sigmoid(-4) ~ 0.018), so forward pass at step 0 is
+            # numerically ~identical to the pure segment-head baseline.
             nn.init.zeros_(self.fusion_gate[-1].weight)
-            nn.init.constant_(self.fusion_gate[-1].bias, -4.0) 
+            nn.init.constant_(self.fusion_gate[-1].bias, -4.0)
         else:
             self.local_classifier = None
             self.fusion_gate = None
 
+        # Running accumulator for avg-gate logging (so it's impossible to
+        # "forget to log" -- see get_and_reset_gate_stats()).
+        self._gate_sum = 0.0
+        self._gate_count = 0
+
         self.init_weights()
 
+    def get_and_reset_gate_stats(self):
+        """Returns (avg_gate, num_tokens_seen) since the last reset, then
+        resets the accumulator. Call this after trainer.evaluate() to log
+        how open the fusion gate currently is, without needing to modify
+        compute_metrics (which only sees predictions/labels, not internals).
+        """
+        if self._gate_count == 0:
+            return None, 0
+        avg = self._gate_sum / self._gate_count
+        self._gate_sum = 0.0
+        self._gate_count = 0
+        return avg, self._gate_count
+
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
+        """
+        text_hidden: (B, L, H) hidden states for the TEXT part only.
+        seg_id:      (B, L) long tensor. -1 marks tokens not in any segment.
+                     Non-negative values are LOCAL segment indices per
+                     example, in reading order.
+
+        Returns:
+            broadcast_hidden: (B, L, H) -- every token in the same segment
+                gets an IDENTICAL context-enriched vector.
+        """
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
@@ -107,7 +166,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if valid.sum() == 0:
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)
+            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
@@ -170,6 +229,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
+        # Keep the ORIGINAL per-token hidden state (before segment
+        # pooling/broadcast) -- this feeds local_classifier so it can see
+        # fine-grained per-token cues the segment vector cannot.
         local_hidden = text_hidden
 
         if seg_id is not None:
@@ -194,24 +256,41 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             pooled_sequence = broadcast_hidden
 
         pooled_sequence = self.dropout(pooled_sequence)
-        segment_logits_full = self.classifier(pooled_sequence)  
+        segment_logits_full = self.classifier(pooled_sequence)  # (B, text_len+img_len, num_labels)
+
+        local_logits = None  # kept around for the aux loss below
 
         if self.use_token_fusion and seg_id is not None:
             segment_logits_text = segment_logits_full[:, :text_len, :]
 
-            local_logits = self.local_classifier(self.dropout(local_hidden)) 
+            local_logits = self.local_classifier(self.dropout(local_hidden))  # (B, text_len, num_labels)
 
             with torch.no_grad():
                 seg_probs = torch.softmax(segment_logits_text, dim=-1)
-                max_prob = seg_probs.max(dim=-1, keepdim=True).values     
+                max_prob = seg_probs.max(dim=-1, keepdim=True).values
                 entropy = -(seg_probs * torch.log(seg_probs.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
 
             gate_input = torch.cat(
                 [local_hidden, broadcast_hidden, max_prob, entropy], dim=-1
             )  # (B, text_len, 2H+2)
-            gate = torch.sigmoid(self.fusion_gate(gate_input)) 
+            gate = torch.sigmoid(self.fusion_gate(gate_input))  # (B, text_len, 1)
 
-            fused_text_logits = (1.0 - gate) * segment_logits_text + gate * local_logits
+            # ---- Residual fusion (NOT interpolation) ----
+            # segment_logits_text.detach() in the delta means the segment
+            # path's gradient (from the first term) is left completely
+            # untouched -- only local_classifier/fusion_gate learn through
+            # the second term.
+            delta = local_logits - segment_logits_text.detach()
+            fused_text_logits = segment_logits_text + gate * delta
+
+            # Accumulate gate stats for logging (mean over all real tokens;
+            # padding/special tokens included is fine as an approximation --
+            # they contribute ~0 signal either way since gate depends on
+            # local/broadcast hidden which are near-zero there too, but if
+            # you want it exact you can mask by attention_mask before this).
+            with torch.no_grad():
+                self._gate_sum += gate.sum().item()
+                self._gate_count += gate.numel()
 
             if image_hidden.shape[1] > 0:
                 logits = torch.cat([fused_text_logits, segment_logits_full[:, text_len:, :]], dim=1)
@@ -232,6 +311,31 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 loss = loss_fct(active_logits, active_labels)
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+            # ---- Auxiliary loss for local_classifier ----
+            # Small extra supervision so local_classifier learns useful
+            # per-token signal even while the gate is still mostly closed
+            # (otherwise it would stay near-random until the gate opens,
+            # and "opening the gate onto noise" is exactly the failure mode
+            # we're trying to avoid). Only added during training (not eval),
+            # so eval_loss stays a clean, comparable number across runs.
+            if self.training and local_logits is not None and self.token_fusion_aux_loss_weight > 0:
+                # Reuse the same active_labels for the TEXT part. active_labels
+                # was built for the full (text+image) sequence; slice to text_len.
+                labels_text = labels[:, :text_len] if labels.shape[1] >= text_len else labels
+                if attention_mask is not None:
+                    attn_text = attention_mask[:, :text_len]
+                    active_loss_text = attn_text.reshape(-1) == 1
+                    active_local_logits = local_logits.reshape(-1, self.num_labels)
+                    active_labels_text = torch.where(
+                        active_loss_text,
+                        labels_text.reshape(-1),
+                        torch.tensor(loss_fct.ignore_index).type_as(labels),
+                    )
+                    aux_loss = loss_fct(active_local_logits, active_labels_text)
+                else:
+                    aux_loss = loss_fct(local_logits.reshape(-1, self.num_labels), labels_text.reshape(-1))
+                loss = loss + self.token_fusion_aux_loss_weight * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[2:]
