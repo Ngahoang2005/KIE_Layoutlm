@@ -511,23 +511,22 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
                 backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                film_params = [p for n, p in self.model.named_parameters() if "film_" in n and p.requires_grad]
+                other_new_params = [p for n, p in self.model.named_parameters()
+                                    if "layoutlmv3" not in n and "film_" not in n and p.requires_grad]
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": backbone_params, "lr": self.args.learning_rate},
+                    {"params": other_new_params, "lr": 5e-4},
+                    {"params": film_params, "lr": 5e-5},   # NEW: LR thấp hơn hẳn, riêng cho FiLM
                 ]
-                
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
-
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
