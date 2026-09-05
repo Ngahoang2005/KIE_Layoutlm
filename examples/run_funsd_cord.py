@@ -464,7 +464,8 @@ def main():
 
     import torch
 
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate + tự log avg_gate
+    # Định nghĩa Trainer tùy chỉnh: tách LR riêng cho backbone / new params /
+    # fusion_gate, và tự động log avg_gate sau mỗi lần eval.
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
@@ -473,8 +474,9 @@ def main():
                     p for n, p in self.model.named_parameters()
                     if "layoutlmv3" in n and p.requires_grad
                 ]
-                # Nhóm 2: fusion_gate riêng -- LR thấp hơn, để gate mở từ từ,
-                # tránh mở trước khi local_classifier đủ tin cậy.
+                # Nhóm 2: fusion_gate riêng -- LR THẤP HƠN các param mới khác,
+                # để gate mở từ từ và không nhảy vọt lên chase một
+                # local_classifier còn đang overfit sớm.
                 gate_params = [
                     p for n, p in self.model.named_parameters()
                     if "fusion_gate" in n and p.requires_grad
@@ -489,7 +491,7 @@ def main():
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
                     {"params": other_new_params, "lr": 5e-4},
-                    {"params": gate_params, "lr": 1e-4},
+                    {"params": gate_params, "lr": 5e-5},  # giảm từ 1e-4 -> 5e-5
                 ]
 
                 self.optimizer = torch.optim.AdamW(
@@ -501,79 +503,4 @@ def main():
 
         def evaluate(self, *args, **kwargs):
             metrics = super().evaluate(*args, **kwargs)
-            # Tự động in + log avg_gate sau MỖI lần eval, không cần nhớ gọi tay.
-            model_for_stats = self.model
-            if hasattr(model_for_stats, "get_and_reset_gate_stats"):
-                avg_gate, n_tokens = model_for_stats.get_and_reset_gate_stats()
-                if avg_gate is not None:
-                    logger.info(f"[token-fusion] avg_gate = {avg_gate:.4f} (over {n_tokens} tokens)")
-                    metrics["eval_avg_fusion_gate"] = avg_gate
-                    self.log({"eval_avg_fusion_gate": avg_gate})
-            return metrics
-
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    # Training
-    if training_args.do_train:
-        checkpoint = last_checkpoint if last_checkpoint else None
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        trainer.save_model()
-
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-
-        metrics = trainer.evaluate()
-
-        max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    # Predict
-    if training_args.do_predict:
-        logger.info("*** Predict ***")
-
-        predictions, labels, metrics = trainer.predict(test_dataset)
-        predictions = np.argmax(predictions, axis=2)
-
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-
-        trainer.log_metrics("test", metrics)
-        trainer.save_metrics("test", metrics)
-
-        output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
-        if trainer.is_world_process_zero():
-            with open(output_test_predictions_file, "w") as writer:
-                for prediction in true_predictions:
-                    writer.write(" ".join(prediction) + "\n")
-
-
-def _mp_fn(index):
-    main()
-
-
-if __name__ == "__main__":
-    main()
+            # Tự động in + log avg_gate sau MỖI lần eval.
