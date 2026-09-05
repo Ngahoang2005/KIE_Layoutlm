@@ -21,26 +21,35 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (otherwise identical) broadcast vector can still support the B-/I-
     distinction at the classifier.
 
-  - NEW (token-fusion): a small auxiliary "local_classifier" sees the
-    ORIGINAL per-token hidden state (before segment pooling/broadcast), and
-    its logits are blended into the segment logits via a per-token,
-    uncertainty-conditioned gate. Fusion happens at the LOGIT level (not
-    hidden-state level) and in RESIDUAL form:
+  - Token-fusion (local_classifier + fusion_gate): a small auxiliary
+    classifier sees the ORIGINAL per-token hidden state (before segment
+    pooling/broadcast), and its logits are blended into the segment logits
+    via a per-token, uncertainty-conditioned gate:
 
         delta = local_logits - segment_logits.detach()
         fused = segment_logits + gate * delta
 
-    This is deliberately NOT `(1-gate)*segment + gate*local`, because that
-    interpolation form multiplies the segment path's gradient by (1-gate)
-    at every step, permanently diluting the signal that made segment-level
-    pooling work in the first place. The residual form leaves the segment
-    path's gradient completely untouched (coefficient 1, not 1-gate) while
-    still letting `local_classifier` learn through `gate * delta`. The gate
-    starts near 0 (bias=-4 -> sigmoid~0.018), so at init the whole model is
-    numerically identical to the pure segment-head baseline; it only opens
-    up where the (detached) segment prediction is already uncertain
-    (high entropy / low max-prob), which is exactly the additive-help
-    regime we want (bofsung, not gay nhieu).
+    RESIDUAL form (not `(1-gate)*segment + gate*local`), so the segment
+    path's gradient is never diluted by (1-gate) -- it stays exactly as
+    strong as in the pure segment-head baseline. Only local_classifier /
+    fusion_gate learn through the second term.
+
+    Two extra safeguards keep the gate honest (see forward() and the loss
+    computation below):
+      1. entropy fed to the gate is NORMALIZED to [0,1] (divided by
+         ln(num_labels)) so it's on the same scale as max_prob -- otherwise
+         the raw ln(7)~1.95 entropy dominates the gate's decision in an
+         uncontrolled way.
+      2. an L1-style SPARSITY penalty on the gate's mean activation is
+         added to the training loss. Without it, the optimizer can cheat:
+         local_classifier (a single Linear layer seeing raw per-token
+         hidden states) overfits the tiny FUNSD train set very fast, and
+         the "cheapest" way to lower train loss becomes "open the gate wide
+         so fused_logits just tracks the overfit local_logits" -- which is
+         exactly what caused avg_gate to jump to ~0.6 and eval accuracy to
+         drop despite train loss looking fine. The sparsity penalty gives
+         opening the gate a real cost, so it only opens where doing so
+         actually reduces the MAIN (non-aux) loss by more than that cost.
 
 This class does NOT touch attention, does NOT build any graph/hypergraph,
 and does NOT modify the pretrained backbone.
@@ -101,11 +110,20 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         # ================================================================
         # Token-fusion module: local (pre-pooling) classifier + uncertainty
-        # -gated RESIDUAL logit fusion. See module docstring for rationale.
+        # -gated RESIDUAL logit fusion, with sparsity regularization.
         # ================================================================
         use_token_fusion = getattr(config, "use_token_fusion", True)
         self.use_token_fusion = use_token_fusion
-        self.token_fusion_aux_loss_weight = getattr(config, "token_fusion_aux_loss_weight", 0.3)
+
+        # Aux loss weight: kept small on purpose -- just enough to "prime"
+        # local_classifier so it isn't pure noise once the gate opens a bit,
+        # but not so large that it overfits the tiny FUNSD train set fast
+        # and drags the gate open with it. (Was 0.3, caused avg_gate~0.6.)
+        self.token_fusion_aux_loss_weight = getattr(config, "token_fusion_aux_loss_weight", 0.05)
+
+        # Sparsity penalty on gate.mean() -- gives "opening the gate" a
+        # real cost in the loss, preventing the overfitting shortcut above.
+        self.token_fusion_gate_reg_weight = getattr(config, "token_fusion_gate_reg_weight", 0.05)
 
         if use_token_fusion:
             self.local_classifier = nn.Linear(config.hidden_size, config.num_labels)
@@ -135,8 +153,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     def get_and_reset_gate_stats(self):
         """Returns (avg_gate, num_tokens_seen) since the last reset, then
         resets the accumulator. Call this after trainer.evaluate() to log
-        how open the fusion gate currently is, without needing to modify
-        compute_metrics (which only sees predictions/labels, not internals).
+        how open the fusion gate currently is.
         """
         if self._gate_count == 0:
             return None, 0
@@ -258,7 +275,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         pooled_sequence = self.dropout(pooled_sequence)
         segment_logits_full = self.classifier(pooled_sequence)  # (B, text_len+img_len, num_labels)
 
-        local_logits = None  # kept around for the aux loss below
+        local_logits = None      # used by the aux loss below
+        gate_for_reg = None      # used by the sparsity penalty below
 
         if self.use_token_fusion and seg_id is not None:
             segment_logits_text = segment_logits_full[:, :text_len, :]
@@ -269,6 +287,12 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_probs = torch.softmax(segment_logits_text, dim=-1)
                 max_prob = seg_probs.max(dim=-1, keepdim=True).values
                 entropy = -(seg_probs * torch.log(seg_probs.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
+                # Normalize entropy to [0, 1] (max possible entropy is
+                # ln(num_labels)) so it's on the same scale as max_prob --
+                # otherwise the raw ~ln(7)=1.95 value dominates the gate
+                # input in an uncontrolled, unintended way.
+                max_entropy = torch.log(torch.tensor(float(self.num_labels), device=entropy.device))
+                entropy = entropy / max_entropy.clamp_min(1e-8)
 
             gate_input = torch.cat(
                 [local_hidden, broadcast_hidden, max_prob, entropy], dim=-1
@@ -276,18 +300,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             gate = torch.sigmoid(self.fusion_gate(gate_input))  # (B, text_len, 1)
 
             # ---- Residual fusion (NOT interpolation) ----
-            # segment_logits_text.detach() in the delta means the segment
-            # path's gradient (from the first term) is left completely
-            # untouched -- only local_classifier/fusion_gate learn through
-            # the second term.
+            # segment_logits_text.detach() in delta means the segment path's
+            # gradient (first term) is completely untouched -- only
+            # local_classifier/fusion_gate learn through the second term.
             delta = local_logits - segment_logits_text.detach()
             fused_text_logits = segment_logits_text + gate * delta
 
-            # Accumulate gate stats for logging (mean over all real tokens;
-            # padding/special tokens included is fine as an approximation --
-            # they contribute ~0 signal either way since gate depends on
-            # local/broadcast hidden which are near-zero there too, but if
-            # you want it exact you can mask by attention_mask before this).
+            gate_for_reg = gate if self.training else None
+
+            # Accumulate gate stats for logging (mean over all tokens incl.
+            # padding is an acceptable approximation here).
             with torch.no_grad():
                 self._gate_sum += gate.sum().item()
                 self._gate_count += gate.numel()
@@ -312,16 +334,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
-            # ---- Auxiliary loss for local_classifier ----
-            # Small extra supervision so local_classifier learns useful
-            # per-token signal even while the gate is still mostly closed
-            # (otherwise it would stay near-random until the gate opens,
-            # and "opening the gate onto noise" is exactly the failure mode
-            # we're trying to avoid). Only added during training (not eval),
-            # so eval_loss stays a clean, comparable number across runs.
+            # ---- Auxiliary loss for local_classifier (small weight) ----
             if self.training and local_logits is not None and self.token_fusion_aux_loss_weight > 0:
-                # Reuse the same active_labels for the TEXT part. active_labels
-                # was built for the full (text+image) sequence; slice to text_len.
                 labels_text = labels[:, :text_len] if labels.shape[1] >= text_len else labels
                 if attention_mask is not None:
                     attn_text = attention_mask[:, :text_len]
@@ -336,6 +350,19 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 else:
                     aux_loss = loss_fct(local_logits.reshape(-1, self.num_labels), labels_text.reshape(-1))
                 loss = loss + self.token_fusion_aux_loss_weight * aux_loss
+
+            # ---- Gate sparsity regularization ----
+            # Gives opening the gate a real cost, so the optimizer can't
+            # cheaply lower train loss just by tracking an overfit
+            # local_classifier -- it must actually help the MAIN loss more
+            # than the penalty costs.
+            if self.training and gate_for_reg is not None and self.token_fusion_gate_reg_weight > 0:
+                if attention_mask is not None:
+                    attn_text = attention_mask[:, :text_len].unsqueeze(-1).float()
+                    gate_reg = (gate_for_reg * attn_text).sum() / attn_text.sum().clamp_min(1.0)
+                else:
+                    gate_reg = gate_for_reg.mean()
+                loss = loss + self.token_fusion_gate_reg_weight * gate_reg
 
         if not return_dict:
             output = (logits,) + outputs[2:]
