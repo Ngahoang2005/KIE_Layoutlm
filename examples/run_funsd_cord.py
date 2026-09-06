@@ -507,22 +507,32 @@ def main():
                 "accuracy": results["overall_accuracy"],
             }
     import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate theo TỪNG NHÓM tham số
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                backbone_params = [p for n, p in self.model.named_parameters()
+                                    if "layoutlmv3" in n and p.requires_grad]
+                # NEW: pool_attn_scorer tách riêng, LR THẤP hơn hẳn (giống backbone) --
+                # vì softmax bên trong nó rất dễ "sập" nhanh về gần one-hot nếu LR cao
+                # (xem docstring trong modeling_layoutlmv3_segment.py).
+                pool_scorer_params = [p for n, p in self.model.named_parameters()
+                                       if "pool_attn_scorer" in n and p.requires_grad]
+                other_new_params = [p for n, p in self.model.named_parameters()
+                                     if "layoutlmv3" not in n and "pool_attn_scorer" not in n
+                                     and p.requires_grad]
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": backbone_params, "lr": self.args.learning_rate},
+                    {"params": other_new_params, "lr": 5e-4},
                 ]
-                
+                if pool_scorer_params:
+                    optimizer_grouped_parameters.append(
+                        {"params": pool_scorer_params, "lr": self.args.learning_rate}  # = LR backbone, thấp
+                    )
+
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )
