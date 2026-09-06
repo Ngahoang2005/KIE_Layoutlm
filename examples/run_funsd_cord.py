@@ -148,6 +148,13 @@ class DataTrainingArguments:
             "inter-segment context head) instead of the vanilla per-token classification head."
         },
     )
+    segment_context_layers: int = field(default=1)
+    segment_pooling_only: bool = field(default=False)
+    segment_context_heads: int = field(default=4)
+    use_first_token_embedding: bool = field(default=True)
+    use_token_segment_read: bool = field(default=True)
+    token_segment_read_heads: int = field(default=1)
+    
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -279,6 +286,12 @@ def main():
     if getattr(data_args, "use_segment_head", False):
         # NEW: segment-level pooling + inter-segment context head.
         # See modeling_layoutlmv3_segment.py for the full design rationale.
+        config.segment_context_layers = data_args.segment_context_layers
+        config.segment_pooling_only = data_args.segment_pooling_only
+        config.segment_context_heads = data_args.segment_context_heads
+        config.use_first_token_embedding = data_args.use_first_token_embedding
+        config.use_token_segment_read = data_args.use_token_segment_read
+        config.token_segment_read_heads = data_args.token_segment_read_heads
         from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
     LayoutLMv3ForSegmentTokenClassification,
 )
