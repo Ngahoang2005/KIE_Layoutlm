@@ -464,7 +464,8 @@ def main():
 
     import torch
 
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate + tự log avg_gate
+    # Định nghĩa Trainer tùy chỉnh: tách LR riêng cho backbone / new params /
+    # fusion_gate, và tự động log avg_gate sau mỗi lần eval.
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
@@ -473,8 +474,9 @@ def main():
                     p for n, p in self.model.named_parameters()
                     if "layoutlmv3" in n and p.requires_grad
                 ]
-                # Nhóm 2: fusion_gate riêng -- LR thấp hơn, để gate mở từ từ,
-                # tránh mở trước khi local_classifier đủ tin cậy.
+                # Nhóm 2: fusion_gate riêng -- LR THẤP HƠN các param mới khác,
+                # để gate mở từ từ và không nhảy vọt lên chase một
+                # local_classifier còn đang overfit sớm.
                 gate_params = [
                     p for n, p in self.model.named_parameters()
                     if "fusion_gate" in n and p.requires_grad
@@ -489,7 +491,7 @@ def main():
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
                     {"params": other_new_params, "lr": 5e-4},
-                    {"params": gate_params, "lr": 1e-4},
+                    {"params": gate_params, "lr": 5e-5},  # giảm từ 1e-4 -> 5e-5
                 ]
 
                 self.optimizer = torch.optim.AdamW(
