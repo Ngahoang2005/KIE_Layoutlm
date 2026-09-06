@@ -21,6 +21,24 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (otherwise identical) broadcast vector can still support the B-/I-
     distinction at the classifier.
 
+  - NEW (attention pooling): instead of plain mean-pooling each segment's
+    token hidden states into one vector, use a small learned scorer to
+    compute per-token attention weights within the segment, then take a
+    weighted sum. This lets the segment vector retain fine-grained
+    per-token information (which token matters more for classifying the
+    segment) WITHOUT breaking the segment self-consistency property --
+    the output is still exactly ONE vector per segment, broadcast
+    identically to every token in it, so nothing downstream changes.
+
+    The scorer's final linear layer is zero-initialized, so at step 0
+    every token gets score 0 -> softmax gives a UNIFORM distribution ->
+    attention-pooling is numerically IDENTICAL to mean-pooling. This means
+    training starts exactly at the current (working) baseline and only
+    gradually learns to reweight tokens where doing so helps -- no risk of
+    an early random-init shock damaging the pretrained representation,
+    unlike late-fusion gates that mix in a second, freshly-initialized
+    classifier's logits.
+
 This class does NOT touch attention, does NOT build any graph/hypergraph,
 and does NOT modify the pretrained backbone. It only replaces what the
 token classifier head "sees" for tokens inside multi-token segments -- an
@@ -68,8 +86,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
-            
-            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
+
+            # positional embedding cho THỨ TỰ segment trong document (reading order)
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
@@ -86,9 +104,46 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
+        # ================================================================
+        # NEW: attention-pooling for segment vector construction.
+        # Replaces `text_hidden[b, mask].mean(dim=0)` with a learned
+        # weighted sum. See module docstring for the zero-init rationale.
+        # ================================================================
+        self.use_attention_pooling = getattr(config, "use_attention_pooling", True)
+        if self.use_attention_pooling:
+            pool_hidden_dim = getattr(config, "attention_pool_hidden_dim", config.hidden_size // 2)
+            self.pool_attn_scorer = nn.Sequential(
+                nn.Linear(config.hidden_size, pool_hidden_dim),
+                nn.Tanh(),
+                nn.Linear(pool_hidden_dim, 1),
+            )
+            # Zero-init the final layer: every token starts with score 0,
+            # so softmax(0,0,...,0) = uniform -> attention-pooling is
+            # numerically IDENTICAL to mean-pooling at step 0.
+            nn.init.zeros_(self.pool_attn_scorer[-1].weight)
+            nn.init.zeros_(self.pool_attn_scorer[-1].bias)
+        else:
+            self.pool_attn_scorer = None
+
         self.init_weights()
         # for param in self.layoutlmv3.parameters():
         #     param.requires_grad = False
+
+    def _pool_segment_vector(self, tokens_in_seg):
+        """
+        tokens_in_seg: (n_tok, H) hidden states of all tokens belonging to
+                       ONE segment (already indexed out via a boolean mask).
+
+        Returns: (H,) pooled vector for that segment -- either a learned
+                 attention-weighted sum (if use_attention_pooling) or a
+                 plain mean (fallback / ablation).
+        """
+        if self.use_attention_pooling:
+            scores = self.pool_attn_scorer(tokens_in_seg).squeeze(-1)  # (n_tok,)
+            weights = torch.softmax(scores, dim=0)                     # (n_tok,)
+            return (weights.unsqueeze(-1) * tokens_in_seg).sum(dim=0)  # (H,)
+        else:
+            return tokens_in_seg.mean(dim=0)
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         """
@@ -125,7 +180,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
-                seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                # NEW: attention-pooling instead of plain mean.
+                seg_vecs[i] = self._pool_segment_vector(text_hidden[b, mask])
 
             if self.segment_context is not None:
                 max_pos = self.segment_position_embedding.num_embeddings
