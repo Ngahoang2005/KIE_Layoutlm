@@ -21,30 +21,34 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (otherwise identical) broadcast vector can still support the B-/I-
     distinction at the classifier.
 
-  - Attention pooling (with temperature): instead of plain mean-pooling
-    each segment's token hidden states into one vector, use a small
-    learned scorer to compute per-token attention weights within the
-    segment, then take a weighted sum. The scorer's final linear layer is
-    zero-initialized, so at step 0 every token gets score 0 -> softmax
-    gives a UNIFORM distribution -> attention-pooling is numerically
-    IDENTICAL to mean-pooling.
+  - NEW (mean+max non-parametric fusion): learned attention-pooling within
+    a segment was tried and found to UNDERPERFORM plain mean-pooling. The
+    likely cause (see literature on Attention-based Deep MIL, Ilse et al.
+    2018): attention pooling only helps when a "bag" has enough instances
+    to make selective weighting statistically meaningful (their gains show
+    up with ~10-50+ instances/bag). FUNSD/CORD segments typically contain
+    only 1-4 tokens -- far too few for a learned per-token scorer to learn
+    anything beyond noise, while still adding enough free parameters (a
+    full MLP scorer) to overfit the tiny (149-doc) train set.
 
-    IMPORTANT (lesson learned from an earlier run where this made things
-    WORSE than plain mean-pooling): zero-init only guarantees identical
-    behavior AT STEP 0, not throughout training. Softmax has no built-in
-    brake -- a small learned score difference gets exponentially amplified,
-    so under a high LR (this module sits in the "new_params" group, LR
-    5e-4 by default) the distribution can collapse from uniform to nearly
-    one-hot within a few hundred steps. For a 100+ word segment (e.g. the
-    long "NOTE..." disclaimer block on FUNSD doc 82092117) that is
-    actively harmful: the segment needs a REPRESENTATIVE/AVERAGE vector,
-    not a vector dominated by 1-2 tokens. `pool_temperature` divides the
-    raw scores before softmax, damping how fast the distribution can
-    sharpen for a given amount of weight change -- it does not change
-    behavior at step 0 (scores are 0 regardless of temperature), but
-    slows down how aggressively the distribution can peak later.
-    Also see run_funsd_cord.py's CustomTrainer: `pool_attn_scorer`
-    parameters get their OWN (lower) LR group for the same reason.
+    Fix: replace the learned scorer with two FIXED, parameter-free pooling
+    operators (mean and max) and blend them with a SINGLE scalar ReZero
+    -style gate (exactly the same pattern already used successfully for
+    segment_context_gate). This adds only ONE extra learnable parameter
+    total for the whole mechanism (vs. hundreds of thousands for an MLP
+    scorer), while still letting the model access "most salient token"
+    information (max) as a supplement to the stable "overall average"
+    signal (mean), without any risk of the pooling operator itself
+    overfitting on 149 training documents.
+
+    seg_vec = seg_mean + pool_max_gate * (seg_max - seg_mean)
+
+    Zero-init pool_max_gate -> at step 0, seg_vec == seg_mean exactly,
+    i.e. numerically identical to the current (working) mean-pooling
+    baseline. Training then gradually learns a single blend coefficient,
+    not a per-token weighting -- much lower capacity, much lower
+    overfitting risk, while still being strictly additive over the
+    baseline.
 
 This class does NOT touch attention, does NOT build any graph/hypergraph,
 and does NOT modify the pretrained backbone. It only replaces what the
@@ -62,7 +66,6 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3PreTrainedModel,
 )
 
-
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids"]
@@ -78,7 +81,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # ---- inter-segment context module ----
+        # ---- Inter-segment context (unchanged) ----
         seg_ctx_layers = getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
@@ -112,62 +115,39 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
         # ================================================================
-        # Attention-pooling for segment vector construction.
-        # Replaces plain mean with a learned weighted sum -- see module
-        # docstring for the zero-init AND temperature rationale.
+        # NEW: mean+max non-parametric fusion for segment vector.
+        # Replaces `text_hidden[b, mask].mean(dim=0)` (and the previously
+        # tried, worse-performing learned attention-pooling) with a
+        # zero-init scalar blend of mean and max pooling. See module
+        # docstring for rationale.
         # ================================================================
-        self.use_attention_pooling = getattr(config, "use_attention_pooling", True)
-        if self.use_attention_pooling:
-            pool_hidden_dim = getattr(config, "attention_pool_hidden_dim", config.hidden_size // 2)
-            self.pool_attn_scorer = nn.Sequential(
-                nn.Linear(config.hidden_size, pool_hidden_dim),
-                nn.Tanh(),
-                nn.Linear(pool_hidden_dim, 1),
-            )
-            # Zero-init the final layer: every token starts with score 0,
-            # so softmax(0,0,...,0) = uniform -> attention-pooling is
-            # numerically IDENTICAL to mean-pooling at step 0.
-            nn.init.zeros_(self.pool_attn_scorer[-1].weight)
-            nn.init.zeros_(self.pool_attn_scorer[-1].bias)
-
-            # NEW: fixed (non-learned) temperature. Dividing scores by a
-            # value > 1 dampens how sharply softmax can peak for a given
-            # amount of weight drift -- does not change behavior at step 0
-            # (scores are exactly 0 there regardless of temperature), but
-            # slows the collapse-to-one-hot failure mode observed without
-            # it. Kept as a plain float, not nn.Parameter: another learned
-            # knob here would add yet another thing that can drift under a
-            # high LR, defeating the purpose.
-            self.pool_temperature = getattr(config, "attention_pool_temperature", 10.0)
+        self.use_meanmax_pooling = getattr(config, "use_meanmax_pooling", True)
+        if self.use_meanmax_pooling:
+            self.pool_max_gate = nn.Parameter(torch.zeros(1))
         else:
-            self.pool_attn_scorer = None
-            self.pool_temperature = None
+            self.pool_max_gate = None
 
         self.init_weights()
-
-    def get_segment_gate_value(self):
-        """Optional introspection hook (used if you wire up a logging
-        callback later). Returns None if segment_context_layers == 0."""
-        if self.segment_context_gate is None:
-            return None
-        return self.segment_context_gate.detach().float().item()
+        # for param in self.layoutlmv3.parameters():
+        #     param.requires_grad = False
 
     def _pool_segment_vector(self, tokens_in_seg):
         """
         tokens_in_seg: (n_tok, H) hidden states of all tokens belonging to
                        ONE segment (already indexed out via a boolean mask).
 
-        Returns: (H,) pooled vector for that segment -- either a learned,
-                 temperature-damped attention-weighted sum (if
-                 use_attention_pooling) or a plain mean (fallback/ablation).
+        Returns: (H,) pooled vector for that segment.
         """
-        if self.use_attention_pooling:
-            scores = self.pool_attn_scorer(tokens_in_seg).squeeze(-1)  # (n_tok,)
-            scores = scores / self.pool_temperature                     # NEW: damp peaking
-            weights = torch.softmax(scores, dim=0)                      # (n_tok,)
-            return (weights.unsqueeze(-1) * tokens_in_seg).sum(dim=0)   # (H,)
+        seg_mean = tokens_in_seg.mean(dim=0)
+        if self.use_meanmax_pooling:
+            if tokens_in_seg.shape[0] == 1:
+                # Single-token segment: max == mean, nothing to blend --
+                # skip the extra op, seg_mean is already exact.
+                return seg_mean
+            seg_max = tokens_in_seg.max(dim=0).values
+            return seg_mean + self.pool_max_gate * (seg_max - seg_mean)
         else:
-            return tokens_in_seg.mean(dim=0)
+            return seg_mean
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         """
@@ -179,7 +159,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                      values are LOCAL segment indices per example, assigned
                      in reading order (0, 1, 2, ...), exactly matching the
                      bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels.
+                     tokenize_and_align_labels (see patch).
 
         Returns:
             broadcast_hidden: (B, L, H) -- every token belonging to the same
@@ -231,7 +211,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        seg_id=None,
+        seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -262,16 +242,21 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         if seg_id is not None:
             text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
 
+            # Add the is-first-token-of-segment signal so the classifier can
+            # still distinguish B- from I- despite the shared pooled vector.
             is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0
+            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
             if seg_id.shape[1] > 1:
                 prev = seg_id[:, :-1]
                 cur = seg_id[:, 1:]
                 changed = (cur != prev) & (cur >= 0)
                 is_first[:, 1:] = changed.long()
+            # A token whose seg_id == -1 (special/pad) is never "first of a segment".
             is_first = is_first * (seg_id >= 0).long()
 
             text_hidden = text_hidden + self.is_first_token_embedding(is_first)
+        # if seg_id is None (e.g. an old checkpoint / different dataloader),
+        # fall back to plain per-token behavior -- text_hidden is untouched.
 
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
