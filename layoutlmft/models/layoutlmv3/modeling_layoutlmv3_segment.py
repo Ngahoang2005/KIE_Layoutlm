@@ -12,19 +12,39 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (HEADER vs QUESTION on FUNSD; parent vs sub-item on CORD).
   - Fix: pool each segment's token hidden states into one vector, run a
     tiny Transformer encoder over the SEQUENCE of segment vectors (reading
-    order) so adjacent segments exchange information, then broadcast the
-    context-enriched vector back to every token in the segment before the
-    (unchanged) token classifier.
-  - To keep the existing BIO scheme / seqeval / compute_metrics pipeline
-    100% unchanged, we do NOT collapse labels to entity-type-only. Instead
-    we add a tiny learned "is-first-token-of-segment" embedding so the
-    (otherwise identical) broadcast vector can still support the B-/I-
-    distinction at the classifier.
+    order) so adjacent segments exchange information.
 
-This class does NOT touch attention, does NOT build any graph/hypergraph,
-and does NOT modify the pretrained backbone. It only replaces what the
-token classifier head "sees" for tokens inside multi-token segments -- an
-orthogonal mechanism to HGA / GraphLayoutLM.
+  - NEW (token-reads-segment, replaces the old hard broadcast):
+    Earlier versions OVERWROTE every token's hidden state with the (shared)
+    segment vector -- this destroyed per-token information and required a
+    separate "is-first-token" embedding just to let the classifier tell
+    B- from I- again. Grounded in two published designs:
+      * DSpERT (Zhu et al., ACL Findings 2023, arXiv:2210.04182) shows that
+        SHALLOW one-shot pooling of tokens into a span representation is
+        "significantly ineffective for long-span entities" -- exactly the
+        failure mode observed here (the 114-word "NOTE..." block on FUNSD
+        doc 82092117, completely missed by the vanilla model). Their fix:
+        treat the span as a QUERY and tokens as KEY/VALUE via cross-attention,
+        rather than a single mean/weighted pool.
+      * DEPTH (arXiv:2405.07788) keeps ordinary tokens completely unmodified
+        in the shared self-attention; only a separate SEGMENT-SUMMARY token
+        is constrained to attend within its segment. Regular tokens are
+        never overwritten -- they only gain the OPTION to look at the
+        segment summary.
+    Combining both: each token QUERIES its own segment's vector via a
+    single-key cross-attention and ADDS the result as a residual --
+    the token's own hidden state is the base, never replaced. The
+    attention out_proj is zero-initialized, so at step 0 this read
+    contributes exactly 0 -> behavior is byte-for-byte identical to
+    "no fusion at all" (the current well-tested backbone). Training then
+    gradually learns how much of the segment summary is worth reading
+    per token -- there is no global broadcast, no risk of drowning a
+    long segment's fine-grained tokens in one shared vector.
+
+  This class does NOT touch attention, does NOT build any graph/hypergraph,
+  and does NOT modify the pretrained backbone. It only ADDS an optional,
+  zero-initialized residual read to what the token classifier "sees" -- an
+  orthogonal mechanism to HGA / GraphLayoutLM.
 """
 import torch
 import torch.nn as nn
@@ -36,6 +56,7 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
+
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -52,11 +73,25 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # ---- NEW: lightweight inter-segment context module ----
-        # Config knobs (optional; safe defaults if not set on the config object).
-        seg_ctx_layers = getattr(config, "segment_context_layers", 1)
+        # ---- ablation knob: is-first-token embedding ----
+        # With the new token-reads-segment design, tokens are no longer
+        # forced identical within a segment, so the classifier can in
+        # principle tell B- from I- from the (untouched) token hidden state
+        # alone. Kept ON by default for safety/back-compat; try turning it
+        # OFF as an ablation once the new fusion is validated.
+        self.use_first_token_embedding = getattr(config, "use_first_token_embedding", True)
+        if self.use_first_token_embedding:
+            self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
+            nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        else:
+            self.is_first_token_embedding = None
+
+        # ---- inter-segment context module (unchanged from before) ----
+        segment_pooling_only = getattr(config, "segment_pooling_only", False)
+        seg_ctx_layers = 0 if segment_pooling_only else getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
+        self.segment_context_layers = seg_ctx_layers
 
         if seg_ctx_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -68,8 +103,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
-            
-            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
+
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
@@ -78,38 +112,56 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_context_gate = None
             self.segment_position_embedding = None
 
-        # Small embedding so the classifier can still tell "first token of the
-        # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
-        # even though every token in the segment otherwise shares one pooled
-        # vector. Initialized near zero so early training resembles the
-        # unmodified baseline.
-        self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
-        nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        # ================================================================
+        # NEW: token-reads-segment cross-attention (DSpERT + DEPTH inspired).
+        # Each token QUERIES the (single) vector of its own segment and ADDS
+        # the result as a residual -- the token's own hidden state is never
+        # replaced. num_heads=1 is deliberate: there is exactly ONE key
+        # (the token's own segment vector) per query, so extra heads would
+        # just be redundant copies of the same single-key attention.
+        # ================================================================
+        self.use_token_segment_read = getattr(config, "use_token_segment_read", True)
+        if self.use_token_segment_read:
+            read_heads = getattr(config, "token_segment_read_heads", 1)
+            self.token_reads_segment = nn.MultiheadAttention(
+                embed_dim=config.hidden_size, num_heads=read_heads, batch_first=True,
+                dropout=getattr(config, "token_segment_read_dropout", 0.0),
+            )
+            # Zero-init: at step 0 the read contributes exactly 0, so
+            # behavior is identical to the model with this module absent.
+            nn.init.zeros_(self.token_reads_segment.out_proj.weight)
+            nn.init.zeros_(self.token_reads_segment.out_proj.bias)
+        else:
+            self.token_reads_segment = None
 
         self.init_weights()
-        # for param in self.layoutlmv3.parameters():
-        #     param.requires_grad = False
+
+    def get_segment_gate_value(self):
+        """Optional introspection hook (used by a logging callback, if any).
+        Returns None if segment_context_layers == 0 (no gate exists)."""
+        if self.segment_context_gate is None:
+            return None
+        return self.segment_context_gate.detach().float().item()
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
+        text_hidden: (B, L, H) hidden states for the TEXT part only.
         seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
                      to any segment (special tokens / padding). Non-negative
                      values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
+                     in reading order (0, 1, 2, ...), matching the
+                     bbox-equality grouping in run_funsd_cord.py's
+                     tokenize_and_align_labels.
 
         Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
+            fused_hidden: (B, L, H) -- token_hidden PLUS an optional residual
+                read from its own segment's context-enriched vector. Unlike
+                the old design, tokens in the same segment are NOT forced
+                identical: each keeps its own base hidden state.
         """
         B, L, H = text_hidden.shape
         device = text_hidden.device
-        broadcast_hidden = text_hidden.clone()
+        fused_hidden = text_hidden.clone()
 
         for b in range(B):
             ids = seg_id[b]
@@ -125,6 +177,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
+                # Mean-pool to build the segment's SUMMARY vector (this part
+                # is unchanged -- only what happens to it afterward differs).
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
 
             if self.segment_context is not None:
@@ -136,10 +190,19 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 seg_vecs_ctx = seg_vecs
 
-            for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+            if self.token_reads_segment is not None:
+                # NEW: per-token residual read, NO overwrite/broadcast.
+                for i, mask in enumerate(seg_masks):
+                    tokens = text_hidden[b, mask].unsqueeze(0)              # (1, n_tok, H) query
+                    seg_kv = seg_vecs_ctx[i].view(1, 1, -1)                  # (1, 1, H) key=value
+                    read, _ = self.token_reads_segment(tokens, seg_kv, seg_kv)
+                    fused_hidden[b, mask] = text_hidden[b, mask] + read.squeeze(0)
+            else:
+                # Fallback: old hard-broadcast behavior (ablation / back-compat).
+                for i, mask in enumerate(seg_masks):
+                    fused_hidden[b, mask] = seg_vecs_ctx[i]
 
-        return broadcast_hidden
+        return fused_hidden
 
     def forward(
         self,
@@ -152,7 +215,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        seg_id=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -183,19 +246,15 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         if seg_id is not None:
             text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
 
-            # Add the is-first-token-of-segment signal so the classifier can
-            # still distinguish B- from I- despite the shared pooled vector.
-            is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
-            if seg_id.shape[1] > 1:
-                prev = seg_id[:, :-1]
-                cur = seg_id[:, 1:]
-                changed = (cur != prev) & (cur >= 0)
-                is_first[:, 1:] = changed.long()
-            # A token whose seg_id == -1 (special/pad) is never "first of a segment".
-            is_first = is_first * (seg_id >= 0).long()
-
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
+            if self.use_first_token_embedding:
+                is_first = torch.zeros_like(seg_id, dtype=torch.long)
+                if seg_id.shape[1] > 1:
+                    prev = seg_id[:, :-1]
+                    cur = seg_id[:, 1:]
+                    changed = (cur != prev) & (cur >= 0)
+                    is_first[:, 1:] = changed.long()
+                is_first = is_first * (seg_id >= 0).long()
+                text_hidden = text_hidden + self.is_first_token_embedding(is_first)
         # if seg_id is None (e.g. an old checkpoint / different dataloader),
         # fall back to plain per-token behavior -- text_hidden is untouched.
 
