@@ -180,8 +180,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         seg_ctx_layers = getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
-        seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
-
+        seg_ctx_dropout = getattr(config, "segment_context_dropout", None)
+        if seg_ctx_dropout is None:
+            seg_ctx_dropout = config.hidden_dropout_prob
         # NEW: relative-position config knobs
         rel_seg_bins = getattr(config, "segment_relative_position_bins", 32)
         rel_seg_max_distance = getattr(config, "segment_relative_max_distance", 32)
