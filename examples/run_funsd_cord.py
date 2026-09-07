@@ -162,6 +162,15 @@ class DataTrainingArguments:
         },
     )
     token_segment_read_dropout: float = field(default=0.0)
+    token_read_norm_reg_weight: float = field(
+        default=0.01,
+        metadata={
+            "help": "Weight of the gradient-carrying L2-norm penalty applied to the POST-gate "
+            "token-read vector during training. Discourages the module from exploiting large, "
+            "non-selective magnitude as a shortcut to lower loss instead of learning genuinely "
+            "selective attention. Set to 0 to disable."
+        },
+    )
 
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
@@ -301,6 +310,7 @@ def main():
         config.use_token_segment_read = data_args.use_token_segment_read
         config.token_segment_read_heads = data_args.token_segment_read_heads
         config.token_segment_read_dropout = data_args.token_segment_read_dropout
+        config.token_read_norm_reg_weight = data_args.token_read_norm_reg_weight
         from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
     LayoutLMv3ForSegmentTokenClassification,
 )
@@ -530,22 +540,27 @@ def main():
             }
     import torch
     # Định nghĩa Trainer tùy chỉnh: tách LR + tự động log các chỉ số chẩn
-    # đoán (segment_context_gate, token-read entropy/norm/single-key-frac)
-    # sau MỖI lần eval, để không bao giờ "quên log" khi cần điều chỉnh tiếp.
+    # đoán (segment_context_gate, token_read_gate, token-read entropy/norm
+    # pre-gate & post-gate/single-key-frac) sau MỖI lần eval, để không bao
+    # giờ "quên log" khi cần điều chỉnh tiếp.
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
                 backbone_params = [p for n, p in self.model.named_parameters()
                                     if "layoutlmv3" in n and p.requires_grad]
-                # token_reads_segment tách riêng, LR THẤP bằng backbone --
-                # vì out_proj zero-init, cần học từ từ. Không dùng LR cao
-                # như segment_context/classifier (bài học từ các module
-                # scorer/gate trước đó: LR cao trên module mới dễ khiến nó
-                # "chạy trước" khi chưa có tín hiệu đủ tốt để học đúng hướng).
+                # token_reads_segment + token_read_gate tách riêng, LR THẤP
+                # bằng backbone -- vì out_proj zero-init, cần học từ từ.
+                # Không dùng LR cao như segment_context/classifier (bài học
+                # từ các module scorer/gate trước đó: LR cao trên module
+                # mới dễ khiến nó "chạy trước" khi chưa có tín hiệu đủ tốt
+                # để học đúng hướng).
                 token_read_params = [p for n, p in self.model.named_parameters()
-                                      if "token_reads_segment" in n and p.requires_grad]
+                                      if ("token_reads_segment" in n or "token_read_gate" in n)
+                                      and p.requires_grad]
                 other_new_params = [p for n, p in self.model.named_parameters()
-                                     if "layoutlmv3" not in n and "token_reads_segment" not in n
+                                     if "layoutlmv3" not in n
+                                     and "token_reads_segment" not in n
+                                     and "token_read_gate" not in n
                                      and p.requires_grad]
 
                 optimizer_grouped_parameters = [
@@ -576,25 +591,37 @@ def main():
                     metrics["eval_segment_context_gate"] = gate_val
                     self.log({"eval_segment_context_gate": gate_val})
 
-            # ---- token_reads_segment diagnostics ----
+            # ---- token_read_gate (separate scale param) ----
+            if hasattr(model_for_stats, "get_token_read_gate_value"):
+                tr_gate = model_for_stats.get_token_read_gate_value()
+                if tr_gate is not None:
+                    logger.info(f"[diagnostics] token_read_gate = {tr_gate:.4f}")
+                    metrics["eval_token_read_gate"] = tr_gate
+                    self.log({"eval_token_read_gate": tr_gate})
+
+            # ---- token_reads_segment diagnostics (eval-set-only now) ----
             if hasattr(model_for_stats, "get_and_reset_token_read_stats"):
                 read_stats = model_for_stats.get_and_reset_token_read_stats()
                 entropy = read_stats.get("avg_read_attn_entropy")
-                read_norm = read_stats.get("avg_read_vector_norm")
+                read_norm = read_stats.get("avg_read_vector_norm")       # post-gate
+                read_raw_norm = read_stats.get("avg_read_raw_norm")      # pre-gate (out_proj output)
                 single_key_frac = read_stats.get("frac_single_key_segments")
 
                 if entropy is not None:
                     logger.info(
                         f"[diagnostics] token_read: avg_attn_entropy(norm)={entropy:.4f} "
-                        f"avg_read_vector_norm={read_norm:.4f} "
+                        f"avg_read_vector_norm(post-gate)={read_norm:.4f} "
+                        f"avg_read_raw_norm(pre-gate)={read_raw_norm:.4f} "
                         f"frac_single_key_segments={single_key_frac:.4f}"
                     )
                     metrics["eval_read_attn_entropy"] = entropy
                     metrics["eval_read_vector_norm"] = read_norm
+                    metrics["eval_read_raw_norm"] = read_raw_norm
                     metrics["eval_frac_single_key_segments"] = single_key_frac
                     self.log({
                         "eval_read_attn_entropy": entropy,
                         "eval_read_vector_norm": read_norm,
+                        "eval_read_raw_norm": read_raw_norm,
                         "eval_frac_single_key_segments": single_key_frac,
                     })
             return metrics
