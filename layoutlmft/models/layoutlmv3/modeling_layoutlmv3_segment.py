@@ -260,8 +260,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                         # segment + the context vector as one extra key.
                         kv = torch.cat([tokens, seg_ctx_kv], dim=1)  # (1, n_tok+1, H)
                         read, attn_weights = self.token_reads_segment(
-                            tokens, kv, kv, need_weights=True, average_attn_weights=True
-                        )
+    tokens, kv, kv, need_weights=True
+)
                         # attn_weights: (1, n_tok, n_tok+1) after averaging
                         # over heads. Log normalized entropy per query row.
                         with torch.no_grad():
