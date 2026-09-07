@@ -37,6 +37,11 @@ class LayoutLMv3Config(BertConfig):
         input_size=224,
         second_input_size=112,
         device='cuda',
+        segment_context_layers: int = 1,
+        segment_context_heads: int = 4,
+        segment_context_dropout: float = None,
+        segment_relative_position_bins: int = 32,
+        segment_relative_max_distance: int = 32,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -58,3 +63,8 @@ class LayoutLMv3Config(BertConfig):
         self.input_size = input_size
         self.second_input_size = second_input_size
         self.device = device
+        self.segment_context_layers = segment_context_layers
+        self.segment_context_heads = segment_context_heads
+        self.segment_context_dropout = segment_context_dropout
+        self.segment_relative_position_bins = segment_relative_position_bins
+        self.segment_relative_max_distance = segment_relative_max_distance
