@@ -15,46 +15,43 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     order) so adjacent segments exchange information.
 
   - Token-reads-segment (DSpERT + DEPTH inspired), FIXED single-key bug:
-    An earlier version used the segment's (single) context vector as the
-    ONLY key/value for each token's cross-attention query. With exactly
-    one key, softmax(x) = 1 regardless of the query -- the attention
-    degenerates into a fixed linear transform of the segment vector,
-    IDENTICAL for every token in the segment. This defeated the entire
-    purpose (each token should be able to decide, from its own content,
-    how much and what to read from its segment) while still adding
-    trainable Q/K/V/out_proj parameters that only add optimization noise
-    -- which is exactly why the earlier version scored slightly WORSE than
-    plain segment+position (no token-read).
+    key/value set is [other tokens in the same segment] PLUS [the
+    segment's context vector as one extra "virtual" key], so softmax is
+    no longer forced to 1 (see earlier single-key version for why that
+    degenerated into a fixed, token-independent linear transform).
 
-    Fix: give each token's query a REAL multi-key attention target -- the
-    key/value set is now [other tokens in the same segment] PLUS [the
-    segment's context vector as one extra "virtual" key]. With >=2 keys,
-    softmax is no longer forced to 1, so different tokens can genuinely
-    attend differently based on their own content. Segments with only one
-    token (no "other tokens" to attend to) fall back to the single-key
-    case, which is an unavoidable degenerate case, not a design flaw.
+  - FIXED (this revision): the earlier attempt at magnitude regularization
+    accumulated the read-vector norm via `.item()` inside `torch.no_grad()`
+    before adding it to the loss -- this DETACHES it from the computation
+    graph, so it contributed literally zero gradient and did not constrain
+    anything (a "regularization" term that does nothing). Fixed by keeping
+    a SEPARATE, gradient-carrying accumulation (a list of tensors, not
+    floats) built during `_segment_pool_and_contextualize` and only
+    reduced (`.mean()`) at the very end -- this stays attached to the
+    graph so `loss.backward()` actually penalizes large injected
+    magnitudes. Regularization is applied to the POST-gate quantity
+    (token_read_gate * read), i.e. what's actually added to the token's
+    hidden state -- not the raw out_proj output -- because that's the only
+    quantity that actually affects the model's behavior; if the gate stays
+    near 0, out_proj is free to have any internal scale without penalty
+    (harmless, since it's gated down to ~0 contribution anyway).
 
-    out_proj is still zero-initialized, so at step 0 this module
-    contributes exactly 0 -- forward pass is byte-for-byte identical to
-    "no token-read at all" (the A configuration). Training then gradually
-    learns how much of the (now genuinely token-dependent) read to use.
+  - FIXED (this revision): the diagnostic accumulators (_read_entropy_sum,
+    _read_norm_sum, ...) previously accumulated on EVERY forward() call,
+    including ordinary training steps -- so by the time
+    get_and_reset_token_read_stats() was called after trainer.evaluate(),
+    the returned "eval_*" numbers were actually a mix of ~1000 training
+    batches' worth of stats plus a handful of eval batches, NOT a clean
+    eval-set-only measurement. Fixed by only accumulating when
+    `self.training` is False (i.e. only during trainer.evaluate() /
+    trainer.predict() forward passes), so "eval_*" metrics genuinely
+    reflect eval-set behavior.
 
-  - Instrumentation: this class exposes two introspection hooks used by
-    CustomTrainer in run_funsd_cord.py to log, after every eval:
-      * segment_context_gate value (how open the inter-segment context
-        blend is)
-      * token-read attention entropy (normalized [0,1]; ~1 means the
-        module hasn't learned to discriminate between keys yet, lower
-        means it has) and the average L2 norm of the residual "read"
-        vector actually added to token hidden states (near-zero means the
-        module is contributing almost nothing regardless of entropy).
-    Both are essential to tell apart "hasn't learned anything useful yet"
-    from "learned something but it's not helping" during tuning.
+  out_proj is still zero-initialized AND token_read_gate starts at 0
+  (belt-and-suspenders), so at step 0 this module contributes exactly 0.
 
 This class does NOT touch attention, does NOT build any graph/hypergraph,
-and does NOT modify the pretrained backbone. It only ADDS an optional,
-zero-initialized residual read to what the token classifier "sees" -- an
-orthogonal mechanism to HGA / GraphLayoutLM.
+and does NOT modify the pretrained backbone.
 """
 import torch
 import torch.nn as nn
@@ -119,7 +116,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         # ================================================================
         # Token-reads-segment cross-attention (DSpERT + DEPTH inspired),
-        # FIXED to use real multi-key attention. See module docstring.
+        # real multi-key attention + separate scale gate + gradient-carrying
+        # magnitude regularization. See module docstring.
         # ================================================================
         self.use_token_segment_read = getattr(config, "use_token_segment_read", True)
         if self.use_token_segment_read:
@@ -128,28 +126,29 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 embed_dim=config.hidden_size, num_heads=read_heads, batch_first=True,
                 dropout=getattr(config, "token_segment_read_dropout", 0.0),
             )
-            # Zero-init: at step 0 the read contributes exactly 0, so
-            # behavior is identical to the model with this module absent.
+            # Separate scalar gate: controls HOW MUCH of the read to use,
+            # decoupled from out_proj (which controls the DIRECTION/content
+            # of what's read). Starts at 0 (ReZero-style).
+            self.token_read_gate = nn.Parameter(torch.zeros(1))
             nn.init.zeros_(self.token_reads_segment.out_proj.weight)
             nn.init.zeros_(self.token_reads_segment.out_proj.bias)
+
+            # Weight for the (now gradient-carrying) magnitude regularizer
+            # applied to the POST-gate injected vector during training.
+            self.token_read_norm_reg_weight = getattr(config, "token_read_norm_reg_weight", 0.01)
         else:
             self.token_reads_segment = None
+            self.token_read_gate = None
+            self.token_read_norm_reg_weight = 0.0
 
-        # ---- Instrumentation accumulators (reset after each eval) ----
-        # Attention entropy: mean, over all (token, segment) pairs with
-        # >=2 keys (single-key segments are skipped -- their entropy is
-        # trivially 0 / undefined and would just dilute the signal).
+        # ---- Instrumentation accumulators (LOGGING ONLY -- detached,
+        # eval-mode-only; see get_and_reset_token_read_stats) ----
         self._read_entropy_sum = 0.0
         self._read_entropy_count = 0
-        # Average L2 norm of the residual "read" vector actually added to
-        # each token's hidden state -- tells you whether the module is
-        # contributing anything in absolute magnitude, independent of how
-        # "sharp" or "flat" its attention pattern is.
-        self._read_norm_sum = 0.0
+        self._read_norm_sum = 0.0   # post-gate norm, for logging
         self._read_norm_count = 0
-        # Fraction of segments that hit the degenerate single-key case
-        # (n_tok == 1) -- if this is very high, most of the dataset's
-        # segments simply can't benefit from this module at all.
+        self._read_raw_norm_sum = 0.0  # pre-gate (out_proj) norm, for logging
+        self._read_raw_norm_count = 0
         self._single_key_seg_count = 0
         self._total_seg_count = 0
 
@@ -162,11 +161,18 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             return None
         return self.segment_context_gate.detach().float().item()
 
+    def get_token_read_gate_value(self):
+        """Optional introspection hook. Returns None if
+        use_token_segment_read == False (no gate exists)."""
+        if self.token_read_gate is None:
+            return None
+        return self.token_read_gate.detach().float().item()
+
     def get_and_reset_token_read_stats(self):
         """Returns a dict of token-read diagnostics accumulated since the
-        last reset, then resets the accumulators. Call this after
-        trainer.evaluate(). Values are None where nothing was accumulated
-        (e.g. use_token_segment_read=False, or seg_id was never passed).
+        last reset (EVAL-MODE FORWARD PASSES ONLY -- see module docstring
+        for why training-time forward passes are excluded), then resets
+        the accumulators. Call this after trainer.evaluate().
         """
         stats = {}
         if self._read_entropy_count > 0:
@@ -177,6 +183,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             stats["avg_read_vector_norm"] = self._read_norm_sum / self._read_norm_count
         else:
             stats["avg_read_vector_norm"] = None
+        if self._read_raw_norm_count > 0:
+            stats["avg_read_raw_norm"] = self._read_raw_norm_sum / self._read_raw_norm_count
+        else:
+            stats["avg_read_raw_norm"] = None
         if self._total_seg_count > 0:
             stats["frac_single_key_segments"] = self._single_key_seg_count / self._total_seg_count
         else:
@@ -186,6 +196,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self._read_entropy_count = 0
         self._read_norm_sum = 0.0
         self._read_norm_count = 0
+        self._read_raw_norm_sum = 0.0
+        self._read_raw_norm_count = 0
         self._single_key_seg_count = 0
         self._total_seg_count = 0
         return stats
@@ -203,12 +215,18 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         Returns:
             fused_hidden: (B, L, H) -- token_hidden PLUS an optional residual
                 read from its own segment (other tokens + context vector).
-                Tokens in the same segment are NOT forced identical: each
-                keeps its own base hidden state.
+            read_norm_reg_term: scalar tensor (WITH gradient) equal to the
+                mean L2 norm of the POST-gate injected read vectors across
+                every token that went through the multi-key branch, or
+                None if token-read is disabled / no segment had >=2 tokens
+                in this batch. Add this (scaled) to the loss during
+                training to discourage the module from exploiting large,
+                non-selective magnitude as a shortcut.
         """
         B, L, H = text_hidden.shape
         device = text_hidden.device
         fused_hidden = text_hidden.clone()
+        read_norms_for_reg = []  # gradient-carrying tensors, reduced at the end
 
         for b in range(B):
             ids = seg_id[b]
@@ -224,7 +242,6 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
-                # Mean-pool to build the segment's SUMMARY vector (unchanged).
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
 
             if self.segment_context is not None:
@@ -242,48 +259,58 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     n_tok = tokens.shape[1]
                     seg_ctx_kv = seg_vecs_ctx[i].view(1, 1, -1)  # (1, 1, H)
 
-                    self._total_seg_count += 1
+                    if not self.training:
+                        self._total_seg_count += 1
 
                     if n_tok == 1:
-                        # Degenerate case: no "other tokens" to attend to.
-                        # Fall back to the single key (segment context
-                        # vector). Entropy is trivially undefined here, so
-                        # it's excluded from the entropy stat, but counted
-                        # separately as frac_single_key_segments.
                         kv = seg_ctx_kv
-                        self._single_key_seg_count += 1
+                        if not self.training:
+                            self._single_key_seg_count += 1
                         read, _ = self.token_reads_segment(
                             tokens, kv, kv, need_weights=False
                         )
                     else:
-                        # Real multi-key attention: other tokens in the
-                        # segment + the context vector as one extra key.
                         kv = torch.cat([tokens, seg_ctx_kv], dim=1)  # (1, n_tok+1, H)
                         read, attn_weights = self.token_reads_segment(
-    tokens, kv, kv, need_weights=True
-)
-                        # attn_weights: (1, n_tok, n_tok+1) after averaging
-                        # over heads. Log normalized entropy per query row.
+                            tokens, kv, kv, need_weights=True
+                        )
+                        # attn_weights: (1, n_tok, n_tok+1), already averaged
+                        # over heads by MultiheadAttention when need_weights=True.
+                        if not self.training:
+                            with torch.no_grad():
+                                w = attn_weights.squeeze(0)  # (n_tok, n_tok+1)
+                                ent = -(w * torch.log(w.clamp_min(1e-8))).sum(dim=-1)
+                                max_ent = torch.log(torch.tensor(float(w.shape[-1]), device=device))
+                                norm_ent = ent / max_ent.clamp_min(1e-8)
+                                self._read_entropy_sum += norm_ent.sum().item()
+                                self._read_entropy_count += norm_ent.numel()
+
+                    read_sq = read.squeeze(0)  # (n_tok, H) -- pre-gate, WITH gradient
+                    gated_read = self.token_read_gate * read_sq  # WITH gradient
+
+                    # ---- gradient-carrying accumulation for regularization ----
+                    if self.training:
+                        read_norms_for_reg.append(gated_read.norm(dim=-1))
+
+                    # ---- detached, eval-only accumulation for logging ----
+                    if not self.training:
                         with torch.no_grad():
-                            w = attn_weights.squeeze(0)  # (n_tok, n_tok+1)
-                            ent = -(w * torch.log(w.clamp_min(1e-8))).sum(dim=-1)  # (n_tok,)
-                            max_ent = torch.log(torch.tensor(float(w.shape[-1]), device=device))
-                            norm_ent = (ent / max_ent.clamp_min(1e-8))
-                            self._read_entropy_sum += norm_ent.sum().item()
-                            self._read_entropy_count += norm_ent.numel()
+                            self._read_raw_norm_sum += read_sq.norm(dim=-1).sum().item()
+                            self._read_raw_norm_count += read_sq.shape[0]
+                            self._read_norm_sum += gated_read.norm(dim=-1).sum().item()
+                            self._read_norm_count += gated_read.shape[0]
 
-                    with torch.no_grad():
-                        read_norm = read.squeeze(0).norm(dim=-1)  # (n_tok,)
-                        self._read_norm_sum += read_norm.sum().item()
-                        self._read_norm_count += read_norm.numel()
-
-                    fused_hidden[b, mask] = text_hidden[b, mask] + read.squeeze(0)
+                    fused_hidden[b, mask] = text_hidden[b, mask] + gated_read
             else:
-                # Fallback: old hard-broadcast behavior (ablation / back-compat).
                 for i, mask in enumerate(seg_masks):
                     fused_hidden[b, mask] = seg_vecs_ctx[i]
 
-        return fused_hidden
+        if read_norms_for_reg:
+            read_norm_reg_term = torch.cat(read_norms_for_reg).mean()
+        else:
+            read_norm_reg_term = None
+
+        return fused_hidden, read_norm_reg_term
 
     def forward(
         self,
@@ -324,8 +351,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
+        read_norm_reg_term = None
         if seg_id is not None:
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            text_hidden, read_norm_reg_term = self._segment_pool_and_contextualize(text_hidden, seg_id)
 
             if self.use_first_token_embedding:
                 is_first = torch.zeros_like(seg_id, dtype=torch.long)
@@ -359,6 +387,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 loss = loss_fct(active_logits, active_labels)
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+            # ---- Magnitude regularization (gradient-carrying, training only) ----
+            if self.training and read_norm_reg_term is not None and self.token_read_norm_reg_weight > 0:
+                loss = loss + self.token_read_norm_reg_weight * read_norm_reg_term
 
         if not return_dict:
             output = (logits,) + outputs[2:]
