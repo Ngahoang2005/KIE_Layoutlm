@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from datasets import ClassLabel, load_dataset
-import evaluate
+from datasets import ClassLabel, load_dataset, load_metric
 import transformers
 import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
@@ -472,7 +471,7 @@ def main():
     )
 
     # Metrics
-    metric = evaluate.load("seqeval")
+    metric = load_metric("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
@@ -518,7 +517,7 @@ def main():
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": new_params, "lr": 5e-4} # Ép cứng LR lớn hơn cho module mới
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
