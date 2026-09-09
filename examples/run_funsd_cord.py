@@ -156,7 +156,12 @@ class DataTrainingArguments:
     second_interpolation: str = field(
         default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
-
+    use_supcon_loss: bool = field(default=True)
+    supcon_weight: float = field(
+    default=0.05,
+    metadata={"help": "Weight of the Supervised Contrastive Loss term added to the CE loss."},
+)
+    supcon_temperature: float = field(default=0.07)
 
 def main():
     # See all possible arguments in layoutlmft/transformers/training_args.py
@@ -527,6 +532,13 @@ def main():
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
+        def log(self, logs):
+            if "loss" in logs and hasattr(self.model, "get_and_reset_supcon_stats"):
+                stats = self.model.get_and_reset_supcon_stats()
+                if stats["avg_supcon_loss"] is not None:
+                    logs["supcon_loss"] = round(stats["avg_supcon_loss"], 4)
+                    logs["supcon_frac_anchors_with_pos"] = round(stats["frac_anchors_with_pos"], 4)
+            super().log(logs)
 
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
