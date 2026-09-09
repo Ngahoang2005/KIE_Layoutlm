@@ -272,6 +272,9 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    config.use_supcon_loss = data_args.use_supcon_loss
+    config.supcon_weight = data_args.supcon_weight
+    config.supcon_temperature = data_args.supcon_temperature
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
