@@ -13,50 +13,28 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     still distinguish B- from I- despite every token in a segment sharing
     one pooled vector.
 
-  - NEW: Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) on the
+  - Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) on the
     segment vectors (seg_vecs_ctx -- AFTER inter-segment context, BEFORE
-    broadcasting to tokens).
+    broadcasting to tokens). Gold TYPE groups are parsed automatically
+    from config.id2label (stripping B-/I- prefixes; "O"/"OTHER" excluded),
+    so this works unchanged on FUNSD, CORD, or any other BIO-tagged
+    dataset -- no hand-picked confusable pairs needed.
 
-    Motivation (quantified via debug.py's nearest-centroid error
-    attribution on 3 CORD checkpoints): 77.2% +/- 1.9% of all
-    misclassified segments have their GOLD type's centroid further away
-    than some OTHER type's centroid -- i.e. even an ideal nearest-centroid
-    classifier would get these wrong, purely because the embedding space
-    places same-type segments too close to (or further than) other types.
-    This is exactly the failure mode SupCon addresses: it explicitly pulls
-    same-gold-type segment vectors together and pushes different-type
-    vectors apart, using ALL segments in the batch at once -- no need to
-    hand-pick which pairs are "confusable" (that hand-picking would not be
-    general across datasets). Gold TYPE groups are parsed automatically
-    from config.id2label (stripping B-/I- prefixes; "O"/"OTHER" is
-    excluded from the loss, since it's a semantically heterogeneous
-    catch-all class that should NOT be pulled together), so this works
-    unchanged on FUNSD, CORD, or any other BIO-tagged dataset.
+    IMPORTANT: whether this helps or hurts is DATASET-DEPENDENT. It was
+    motivated and validated via debug.py's nearest-centroid error
+    attribution on CORD (77.2% +/- 1.9% of misclassified segments were
+    attributable to embedding overlap there). On FUNSD, the dominant
+    error mode described in the accompanying report is CONTEXTUAL
+    confusion between neighboring segments (HEADER vs QUESTION, disambiguated
+    by whether an ANSWER follows) -- a positional/contextual signal that
+    segment_context (order-aware) already targets, not a static
+    same-type-clustering problem that SupCon (order-agnostic) addresses.
+    Always run debug.py's error-attribution analysis on the TARGET
+    dataset before assuming SupCon will help there too.
 
-    Implementation notes (each chosen to avoid failure modes seen in
-    earlier experiments on this codebase):
-      * Embeddings are L2-NORMALIZED before the dot product (standard for
-        contrastive losses). This means the loss operates purely on
-        COSINE similarity/direction -- there is no "cheap" way for the
-        optimizer to lower this loss by inflating vector magnitude (the
-        exact failure mode that broke the earlier token_reads_segment
-        residual-read experiment). Direction is the only thing being
-        optimized, which is exactly what we want the embedding space to
-        improve.
-      * The loss is added directly to the total loss with a SMALL fixed
-        weight (no learned gate needed here -- unlike the architectural
-        additions tried before, this is a pure auxiliary loss term that
-        does not change the forward computation path at all; it only
-        reshapes gradients flowing into segment_context / pooling, so the
-        "zero-init to match baseline at step 0" concern that applied to
-        new residual branches does not apply here).
-      * Only computed during training (self.training), and only over
-        segments whose gold type is known and != "O"/"OTHER". Segments
-        with no positive (no other same-type segment in this micro-batch)
-        are automatically excluded from the loss (standard SupCon
-        practice), and this exclusion rate is exposed via
-        get_and_reset_supcon_stats() so you can monitor whether batch
-        size / composition gives the loss enough signal to actually fire.
+  Instrumentation: get_segment_gate_value() and get_and_reset_supcon_stats()
+  expose diagnostics consumed by CustomTrainer in run_funsd_cord.py (no
+  wandb dependency -- plain console/logger output, Kaggle-friendly).
 
 This class does NOT touch attention, does NOT build any graph/hypergraph,
 and does NOT modify the pretrained backbone.
@@ -124,7 +102,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_position_embedding = None
 
         # ================================================================
-        # NEW: Supervised Contrastive Loss on segment vectors.
+        # Supervised Contrastive Loss on segment vectors.
         # ================================================================
         self.use_supcon_loss = getattr(config, "use_supcon_loss", True)
         self.supcon_weight = getattr(config, "supcon_weight", 0.05)
@@ -134,6 +112,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             type_of_label, type_vocab = self._build_type_of_label(config)
             self.register_buffer("type_of_label", type_of_label, persistent=True)
             self.type_vocab = type_vocab  # kept for debugging/inspection only
+            n_excluded = int((type_of_label < 0).sum().item())
+            print(
+                f"[SupCon init] parsed {len(type_vocab)} entity type(s) from config.id2label: "
+                f"{type_vocab} | {n_excluded}/{len(type_of_label)} label ids excluded (O/OTHER/unknown). "
+                f"If type_vocab looks empty or wrong, config.id2label was likely not set correctly "
+                f"before from_pretrained() -- SupCon will silently no-op in that case."
+            )
         else:
             self.type_of_label = None
             self.type_vocab = []
@@ -150,18 +135,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     @staticmethod
     def _build_type_of_label(config):
         """
-        Parses config.id2label (e.g. {0: "O", 1: "B-HEADER", 2: "I-HEADER",
-        3: "B-QUESTION", ...} or CORD-style {..., "B-MENU.PRICE": ..., ...})
-        into a LongTensor (num_labels,) mapping label_id -> type_id, where
-        "O"/"OTHER" maps to -1 (sentinel meaning "excluded from SupCon"),
-        and every other label maps to a nonnegative type id shared by all
-        labels with the same string after stripping the "B-"/"I-" prefix
-        (i.e. B-HEADER and I-HEADER get the SAME type id -- SupCon groups
-        by ENTITY TYPE, not by BIO tag).
-
-        Falls back to "everything excluded" (all -1) if config.id2label is
-        missing or malformed, so the model still runs (with SupCon
-        effectively a no-op) rather than crashing.
+        Parses config.id2label into a LongTensor (num_labels,) mapping
+        label_id -> type_id, where "O"/"OTHER" maps to -1 (excluded from
+        SupCon), and B-/I- variants of the same type share the same
+        nonnegative type id.
         """
         id2label = getattr(config, "id2label", None)
         num_labels = config.num_labels
@@ -204,21 +181,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     def get_and_reset_supcon_stats(self):
         """Returns a dict of SupCon diagnostics accumulated since the last
         reset (TRAINING-mode forward passes only), then resets the
-        accumulators. Intended to be called periodically (e.g. every
-        logging_steps) from the training loop -- see CustomTrainer.log()
-        override in run_funsd_cord.py.
+        accumulators.
 
         Keys:
           avg_supcon_loss: mean SupCon loss value over accumulated steps,
-              or None if SupCon never fired (e.g. disabled, or every batch
-              happened to have zero valid anchors).
+              or None if SupCon never fired.
           frac_anchors_with_pos: fraction of type-labeled (non-"O")
               segments that had at least one same-type "positive" partner
               elsewhere in their micro-batch, averaged over accumulated
-              steps. Low values mean the loss rarely has anything to work
-              with (batch too small / too few segments per type) -- a
-              signal to increase batch size or gradient_accumulation, or
-              reconsider supcon_weight.
+              steps. Low values -> batch too small / too few segments per
+              type for the loss to have anything to work with.
         """
         stats = {}
         if self._supcon_loss_count > 0:
@@ -238,17 +210,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
     def _compute_supcon_loss(self, vecs, type_ids):
         """
-        vecs:     (N, H) float tensor, WITH gradient -- pooled+context
-                  segment vectors collected from the whole micro-batch
-                  (only segments with a known, non-"O" type are included
-                  by the caller).
+        vecs:     (N, H) float tensor, WITH gradient.
         type_ids: (N,) long tensor -- entity-type group id per vector.
-                  Equal ids = positive pair. No gradient needed.
 
-        Returns (loss, frac_anchors_with_positive):
-            loss is a 0-dim tensor WITH gradient, or None if N < 2 or no
-            anchor in this batch has a same-type partner to contrast
-            against (nothing to learn from this batch for this loss).
+        Returns (loss, frac_anchors_with_positive). loss is None if N < 2
+        or no anchor has a same-type partner in this batch.
         """
         N = vecs.shape[0]
         if N < 2:
@@ -261,13 +227,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self_mask = torch.eye(N, dtype=torch.bool, device=vecs.device)
         positive_mask = same_type & (~self_mask)
 
-        # Denominator: log-sum-exp similarity to every OTHER sample
-        # (standard SupCon "L_out" formulation).
         sim_for_denom = sim.masked_fill(self_mask, float("-inf"))
-        log_denom = torch.logsumexp(sim_for_denom, dim=1, keepdim=True)  # (N, 1)
-        log_prob = sim - log_denom  # (N, N)
+        log_denom = torch.logsumexp(sim_for_denom, dim=1, keepdim=True)
+        log_prob = sim - log_denom
 
-        pos_count = positive_mask.sum(dim=1)  # (N,)
+        pos_count = positive_mask.sum(dim=1)
         has_positive = pos_count > 0
         if not bool(has_positive.any()):
             return None, 0.0
@@ -283,19 +247,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_hidden: (B, L, H) hidden states for the TEXT part only.
         seg_id:      (B, L) long tensor. -1 marks tokens not in any segment.
         labels_text: optional (B, L) long tensor of gold BIO label ids,
-                     ALREADY SLICED to the text-only length (matching
-                     seg_id). Only used (and only when self.training) to
-                     collect (segment_vector, gold_type) pairs for SupCon.
+                     ALREADY SLICED to the text-only length. Only used
+                     (and only when self.training) to collect
+                     (segment_vector, gold_type) pairs for SupCon.
 
         Returns:
-            fused_hidden: (B, L, H) -- every token in the same segment
-                gets an IDENTICAL context-enriched vector.
-            supcon_vecs: (N, H) tensor WITH gradient of collected segment
-                vectors across the whole batch (only non-"O" segments), or
-                None if SupCon is disabled / labels_text is None / not
-                training / no segment qualified.
-            supcon_types: (N,) long tensor of type ids matching
-                supcon_vecs, or None under the same conditions.
+            fused_hidden: (B, L, H)
+            supcon_vecs: (N, H) tensor WITH gradient, or None.
+            supcon_types: (N,) long tensor, or None.
         """
         B, L, H = text_hidden.shape
         device = text_hidden.device
@@ -314,7 +273,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if valid.sum() == 0:
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
+            uniq_segs = torch.unique(ids[valid], sorted=True)
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
@@ -343,7 +302,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     if rep_label < 0 or rep_label >= self.type_of_label.shape[0]:
                         continue
                     type_id = int(self.type_of_label[rep_label].item())
-                    if type_id < 0:  # "O"/"OTHER" or unknown -- excluded
+                    if type_id < 0:
                         continue
                     supcon_vec_list.append(seg_vecs_ctx[i])
                     supcon_type_list.append(type_id)
@@ -393,7 +352,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             valid_span=valid_span,
         )
 
-        sequence_output = outputs[0]  # (B, text_len + image_len, H)
+        sequence_output = outputs[0]
         text_len = input_ids.shape[1]
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
@@ -416,8 +375,6 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     is_first[:, 1:] = changed.long()
                 is_first = is_first * (seg_id >= 0).long()
                 text_hidden = text_hidden + self.is_first_token_embedding(is_first)
-        # if seg_id is None (e.g. an old checkpoint / different dataloader),
-        # fall back to plain per-token behavior -- text_hidden is untouched.
 
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
@@ -440,7 +397,6 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
-            # ---- Supervised Contrastive Loss (training only) ----
             if self.training and self.use_supcon_loss and supcon_vecs is not None:
                 supcon_loss, frac_pos = self._compute_supcon_loss(supcon_vecs, supcon_types)
                 if supcon_loss is not None:
