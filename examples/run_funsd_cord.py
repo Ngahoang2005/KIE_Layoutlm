@@ -158,10 +158,11 @@ class DataTrainingArguments:
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
     use_supcon_loss: bool = field(default=True)
     supcon_weight: float = field(
-    default=0.05,
-    metadata={"help": "Weight of the Supervised Contrastive Loss term added to the CE loss."},
-)
+        default=0.05,
+        metadata={"help": "Weight of the Supervised Contrastive Loss term added to the CE loss."},
+    )
     supcon_temperature: float = field(default=0.07)
+
 
 def main():
     # See all possible arguments in layoutlmft/transformers/training_args.py
@@ -272,9 +273,17 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    # ---- IMPORTANT: id2label/label2id must be set BEFORE from_pretrained()
+    # below, so LayoutLMv3ForSegmentTokenClassification._build_type_of_label
+    # can correctly parse entity types for SupCon. Without this, SupCon
+    # silently falls back to "everything excluded" (see the print()
+    # warning in the model's __init__).
+    config.id2label = {i: l for i, l in enumerate(label_list)}
+    config.label2id = {l: i for i, l in enumerate(label_list)}
     config.use_supcon_loss = data_args.use_supcon_loss
     config.supcon_weight = data_args.supcon_weight
     config.supcon_temperature = data_args.supcon_temperature
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
@@ -515,7 +524,9 @@ def main():
                 "accuracy": results["overall_accuracy"],
             }
     import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+    # Định nghĩa Trainer tùy chỉnh: tách Learning Rate + log toàn bộ chỉ số
+    # chẩn đoán (segment_context_gate, supcon_loss, supcon_frac_anchors_with_pos)
+    # ra console/logger -- KHÔNG dùng wandb, phù hợp chạy trên Kaggle.
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
@@ -528,20 +539,58 @@ def main():
                     {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
                     {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
                 ]
-                
+
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
+
         def log(self, logs):
-            if "loss" in logs and hasattr(self.model, "get_and_reset_supcon_stats"):
-                stats = self.model.get_and_reset_supcon_stats()
-                if stats["avg_supcon_loss"] is not None:
-                    logs["supcon_loss"] = round(stats["avg_supcon_loss"], 4)
-                    logs["supcon_frac_anchors_with_pos"] = round(stats["frac_anchors_with_pos"], 4)
+            # Gọi mỗi `logging_steps` bước train -- gắn thêm chỉ số SupCon
+            # (nếu có) và segment_context_gate vào cùng dict logs, để chúng
+            # hiện thẳng trên console/notebook output (Kaggle), không cần wandb.
+            if "loss" in logs:
+                if hasattr(self.model, "get_and_reset_supcon_stats"):
+                    stats = self.model.get_and_reset_supcon_stats()
+                    if stats["avg_supcon_loss"] is not None:
+                        logs["supcon_loss"] = round(stats["avg_supcon_loss"], 4)
+                        logs["supcon_frac_anchors_with_pos"] = round(stats["frac_anchors_with_pos"], 4)
+                    else:
+                        logs["supcon_loss"] = None
+                        logs["supcon_frac_anchors_with_pos"] = None
+                if hasattr(self.model, "get_segment_gate_value"):
+                    gate_val = self.model.get_segment_gate_value()
+                    if gate_val is not None:
+                        logs["segment_context_gate"] = round(gate_val, 4)
             super().log(logs)
+
+            # In thêm 1 dòng rõ ràng ra console để dễ theo dõi khi cuộn qua
+            # log dài trên Kaggle (super().log() ở trên vẫn ghi vào history
+            # như bình thường, dòng print này chỉ là hiển thị bổ sung).
+            if "loss" in logs:
+                parts = [f"step={self.state.global_step}", f"loss={logs.get('loss')}"]
+                if logs.get("supcon_loss") is not None:
+                    parts.append(f"supcon_loss={logs['supcon_loss']}")
+                    parts.append(f"supcon_frac_pos={logs['supcon_frac_anchors_with_pos']}")
+                if logs.get("segment_context_gate") is not None:
+                    parts.append(f"seg_ctx_gate={logs['segment_context_gate']}")
+                print("[train-diagnostics] " + " | ".join(parts))
+
+        def evaluate(self, *args, **kwargs):
+            metrics = super().evaluate(*args, **kwargs)
+            # Sau MỖI lần eval, in thêm giá trị segment_context_gate hiện tại
+            # (SupCon không tích lũy trong eval vì self.training=False khi
+            # đó, nên không có gì để log riêng cho SupCon ở đây -- đúng như
+            # thiết kế, vì SupCon chỉ là loss phụ trợ lúc train).
+            if hasattr(self.model, "get_segment_gate_value"):
+                gate_val = self.model.get_segment_gate_value()
+                if gate_val is not None:
+                    logger.info(f"[eval-diagnostics] segment_context_gate = {gate_val:.4f}")
+                    metrics["eval_segment_context_gate"] = gate_val
+                    print(f"[eval-diagnostics] segment_context_gate = {gate_val:.4f}")
+            return metrics
 
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
@@ -553,16 +602,6 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-    # Initialize our Trainer
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     tokenizer=tokenizer,
-    #     data_collator=data_collator,
-    #     compute_metrics=compute_metrics,
-    # )
 
     # Training
     if training_args.do_train:
