@@ -272,8 +272,8 @@ def main():
     )
     config.id2label = {i: l for i, l in enumerate(label_list)}
     config.label2id = {l: i for i, l in enumerate(label_list)}
-    config.use_crf_loss = data_args.use_crf_loss
-    config.crf_weight = data_args.crf_weight
+    config.use_crf_loss = model_args.use_crf_loss
+    config.crf_weight = model_args.crf_weight
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
