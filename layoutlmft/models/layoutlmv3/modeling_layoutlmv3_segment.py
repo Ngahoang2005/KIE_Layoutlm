@@ -357,22 +357,33 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         """
         Adds crf_logit_fusion_gate * log_marginal[type] into every label
         column belonging to that type, at every token of the corresponding
-        segment. logits is modified via non-in-place ops to keep autograd
-        clean (returns a new tensor).
+        segment. Safely handles visual tokens by padding the boolean mask.
         """
-        log_marginal = self.crf.marginals(crf_batch["emissions"], crf_batch["mask"])  # (n_crf_docs, maxN, n_types)
-        bonus = self.crf_logit_fusion_gate * log_marginal  # (n_crf_docs, maxN, n_types)
+        log_marginal = self.crf.marginals(crf_batch["emissions"], crf_batch["mask"])  
+        bonus = self.crf_logit_fusion_gate * log_marginal  
 
-        fused = logits
+        # Clone 1 lần duy nhất ở ngoài để bảo toàn autograd
+        fused = logits.clone()
+        total_len = fused.shape[1]
+
         for crf_doc_idx, seg_list in enumerate(crf_batch["seg_masks"]):
             for seg_pos, (b, token_mask) in enumerate(seg_list):
+                
+                # Bơm thêm False vào đuôi token_mask (512) để bao trùm luôn phần hình ảnh (-> 709)
+                text_len = token_mask.shape[0]
+                full_mask = torch.zeros(total_len, dtype=torch.bool, device=logits.device)
+                full_mask[:text_len] = token_mask
+
                 for type_id, label_ids in enumerate(self._label_ids_for_type):
                     if not label_ids:
                         continue
                     add_val = bonus[crf_doc_idx, seg_pos, type_id]
-                    idx = torch.tensor(label_ids, device=logits.device)
-                    fused = fused.clone()
-                    fused[b, token_mask][:, idx] = fused[b, token_mask][:, idx] + add_val
+                    
+                    # Trích xuất và cộng an toàn (tránh lỗi chained indexing)
+                    temp = fused[b, full_mask].clone()
+                    temp[:, label_ids] = temp[:, label_ids] + add_val
+                    fused[b, full_mask] = temp
+                    
         return fused
 
     def forward(
