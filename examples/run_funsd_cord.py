@@ -535,12 +535,27 @@ def main():
                 )
             return self.optimizer
         def log(self, logs):
-            if "loss" in logs and hasattr(self.model, "get_and_reset_crf_stats"):
-                stats = self.model.get_and_reset_crf_stats()
-                if stats["avg_crf_loss"] is not None:
-                    logs["crf_loss"] = round(stats["avg_crf_loss"], 4)
-                if stats["crf_type_accuracy"] is not None:
-                    logs["crf_type_accuracy"] = round(stats["crf_type_accuracy"], 4)
+            if "loss" in logs:
+                # 1. Ghi nhận CRF Loss và Accuracy
+                if hasattr(self.model, "get_and_reset_crf_stats"):
+                    stats = self.model.get_and_reset_crf_stats()
+                    if stats["avg_crf_loss"] is not None:
+                        logs["crf_loss"] = round(stats["avg_crf_loss"], 4)
+                    if stats["crf_type_accuracy"] is not None:
+                        logs["crf_type_accuracy"] = round(stats["crf_type_accuracy"], 4)
+                
+                # 2. Ghi nhận CRF Logit Fusion Gate (Quan trọng nhất để theo dõi)
+                if hasattr(self.model, "get_crf_fusion_gate_value"):
+                    fusion_gate = self.model.get_crf_fusion_gate_value()
+                    if fusion_gate is not None:
+                        logs["crf_fusion_gate"] = round(fusion_gate, 4)
+                        
+                # 3. Ghi nhận Segment Context Gate (Để so sánh mức độ đóng góp)
+                if hasattr(self.model, "get_segment_gate_value"):
+                    seg_gate = self.model.get_segment_gate_value()
+                    if seg_gate is not None:
+                        logs["segment_ctx_gate"] = round(seg_gate, 4)
+
             super().log(logs)
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
