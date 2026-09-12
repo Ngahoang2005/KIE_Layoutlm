@@ -66,8 +66,11 @@ class ModelArguments:
             "with private models)."
         },
     )
-
-
+    use_crf_loss: bool = field(default=True)
+    crf_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight of the segment-level CRF auxiliary NLL loss added to the CE loss."},
+    )
 @dataclass
 class DataTrainingArguments:
     """
@@ -267,6 +270,10 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    config.id2label = {i: l for i, l in enumerate(label_list)}
+    config.label2id = {l: i for i, l in enumerate(label_list)}
+    config.use_crf_loss = data_args.use_crf_loss
+    config.crf_weight = data_args.crf_weight
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
@@ -527,7 +534,14 @@ def main():
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
-
+        def log(self, logs):
+            if "loss" in logs and hasattr(self.model, "get_and_reset_crf_stats"):
+                stats = self.model.get_and_reset_crf_stats()
+                if stats["avg_crf_loss"] is not None:
+                    logs["crf_loss"] = round(stats["avg_crf_loss"], 4)
+                if stats["crf_type_accuracy"] is not None:
+                    logs["crf_type_accuracy"] = round(stats["crf_type_accuracy"], 4)
+            super().log(logs)
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
