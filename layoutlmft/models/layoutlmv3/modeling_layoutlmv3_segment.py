@@ -1,4 +1,4 @@
-#layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
+# layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
 # coding=utf-8
 """
 LayoutLMv3ForSegmentTokenClassification
@@ -21,6 +21,17 @@ Core idea (grounded in error analysis on FUNSD + CORD):
     (otherwise identical) broadcast vector can still support the B-/I-
     distinction at the classifier.
 
+ONLY CHANGE vs. the previous version:
+  `segment_use_position_embedding` is now a SEPARATE config flag instead of
+  being tied to `segment_context_layers > 0`. Previously, setting
+  segment_context_layers=0 to ablate the Transformer ALSO silently removed
+  the segment positional embedding, so an "ctx=0 vs ctx=1" comparison mixed
+  two independent changes and could not attribute the difference to either.
+  With the flag separated you can run the clean 2x2:
+      ctx=0, pos=0   ctx=0, pos=1   ctx=1, pos=0   ctx=1, pos=1
+  and isolate what the self-attention contributes on its own from what
+  merely knowing the reading-order index contributes.
+
 This class does NOT touch attention, does NOT build any graph/hypergraph,
 and does NOT modify the pretrained backbone. It only replaces what the
 token classifier head "sees" for tokens inside multi-token segments -- an
@@ -37,6 +48,7 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3PreTrainedModel,
 )
 
+
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids"]
@@ -52,11 +64,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # ---- NEW: lightweight inter-segment context module ----
+        # ---- lightweight inter-segment context module ----
         # Config knobs (optional; safe defaults if not set on the config object).
         seg_ctx_layers = getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
+        # Separated from seg_ctx_layers on purpose -- see module docstring.
+        use_pos_embed = getattr(config, "segment_use_position_embedding", True)
 
         if seg_ctx_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -68,14 +82,17 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
-            
-            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
+        else:
+            self.segment_context = None
+            self.segment_context_gate = None
+
+        # Positional embedding for the ORDER of segments within the document
+        # (reading order). Now independent of whether the Transformer exists.
+        if use_pos_embed:
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
         else:
-            self.segment_context = None
-            self.segment_context_gate = None
             self.segment_position_embedding = None
 
         # Small embedding so the classifier can still tell "first token of the
@@ -100,7 +117,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                      values are LOCAL segment indices per example, assigned
                      in reading order (0, 1, 2, ...), exactly matching the
                      bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
+                     tokenize_and_align_labels.
 
         Returns:
             broadcast_hidden: (B, L, H) -- every token belonging to the same
@@ -128,13 +145,26 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
 
             if self.segment_context is not None:
-                max_pos = self.segment_position_embedding.num_embeddings
-                positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
-                seg_vecs_with_pos = seg_vecs + self.segment_position_embedding(positions)
-                ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
+                # positional embedding is now optional and independent
+                if self.segment_position_embedding is not None:
+                    max_pos = self.segment_position_embedding.num_embeddings
+                    positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
+                    seg_vecs_input = seg_vecs + self.segment_position_embedding(positions)
+                else:
+                    seg_vecs_input = seg_vecs
+
+                ctx_out = self.segment_context(seg_vecs_input.unsqueeze(0)).squeeze(0)
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
-                seg_vecs_ctx = seg_vecs
+                # No Transformer. The positional embedding, if enabled, is
+                # still added so that "ctx=0, pos=1" is a meaningful cell of
+                # the ablation grid (pooling + order signal, no attention).
+                if self.segment_position_embedding is not None:
+                    max_pos = self.segment_position_embedding.num_embeddings
+                    positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
+                    seg_vecs_ctx = seg_vecs + self.segment_position_embedding(positions)
+                else:
+                    seg_vecs_ctx = seg_vecs
 
             for i, mask in enumerate(seg_masks):
                 broadcast_hidden[b, mask] = seg_vecs_ctx[i]
@@ -152,7 +182,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        seg_id=None,  # (batch, text_seq_len), see docstring above
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -186,7 +216,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             # Add the is-first-token-of-segment signal so the classifier can
             # still distinguish B- from I- despite the shared pooled vector.
             is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
+            is_first[:, 0] = 0  # position 0 is a special token ([CLS]); seg_id=-1 there anyway
             if seg_id.shape[1] > 1:
                 prev = seg_id[:, :-1]
                 cur = seg_id[:, 1:]
