@@ -83,7 +83,15 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
         if seg_ctx_layers > 0:
-            self.seg_len_gate_threshold = nn.Parameter(torch.tensor(3.0))
+            # PATCH: hieu chinh lai gia tri khoi tao theo so lieu thuc te tu
+            # probe_segment_context.py -- median segment SUA DUNG = 9.0 tu,
+            # median segment LAM SAI = 5.0 tu. Threshold=3.0 (gia tri doan
+            # truoc, CHUA co so lieu) dat qua thap: tai seg_len=5 (dung
+            # nhom can bi chan), sigmoid((5-3)*1)=0.88 -- gan nhu KHONG chan
+            # gi ca, di nguoc lai muc dich thiet ke. Doi threshold ve diem
+            # giua 2 median (7.0) de co chan dung nhom can chan tu dau,
+            # thay vi bat model tu hoc lai tu 1 diem khoi tao sai lech xa.
+            self.seg_len_gate_threshold = nn.Parameter(torch.tensor(7.0))
             self.seg_len_gate_slope = nn.Parameter(torch.tensor(1.0))
         else:
             self.seg_len_gate_threshold = None
