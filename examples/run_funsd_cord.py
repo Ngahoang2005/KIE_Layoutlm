@@ -26,95 +26,217 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0")
 
 logger = logging.getLogger(__name__)
 from layoutlmft.data.image_utils import RandomResizedCropAndInterpolationWithTwoPic, pil_loader, Compose
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+
+from timm.data.constants import \
+    IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
+
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(metadata={"help": "Path to pretrained model"})
-    config_name: Optional[str] = field(default=None)
-    tokenizer_name: Optional[str] = field(default=None)
-    cache_dir: Optional[str] = field(default=None)
-    model_revision: str = field(default="main")
-    use_auth_token: bool = field(default=False)
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
+    )
+
 
 @dataclass
 class DataTrainingArguments:
-    task_name: Optional[str] = field(default="ner")
-    dataset_name: Optional[str] = field(default='funsd')
-    dataset_config_name: Optional[str] = field(default=None)
-    train_file: Optional[str] = field(default=None)
-    validation_file: Optional[str] = field(default=None)
-    test_file: Optional[str] = field(default=None)
-    overwrite_cache: bool = field(default=False)
-    preprocessing_num_workers: Optional[int] = field(default=None)
-    pad_to_max_length: bool = field(default=True)
-    max_train_samples: Optional[int] = field(default=None)
-    max_val_samples: Optional[int] = field(default=None)
-    max_test_samples: Optional[int] = field(default=None)
-    label_all_tokens: bool = field(default=False)
-    return_entity_level_metrics: bool = field(default=False)
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    task_name: Optional[str] = field(default="ner", metadata={"help": "The name of the task (ner, pos...)."})
+    dataset_name: Optional[str] = field(
+        default='funsd', metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "The input training data file (a csv or JSON file)."}
+    )
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate on (a csv or JSON file)."},
+    )
+    test_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input test data file to predict on (a csv or JSON file)."},
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+    pad_to_max_length: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to pad all samples to model maximum sentence length. "
+            "If False, will pad the samples dynamically when batching to the maximum length in the batch. More "
+            "efficient on GPU but very bad for TPU."
+        },
+    )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        },
+    )
+    max_val_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of validation examples to this "
+            "value if set."
+        },
+    )
+    max_test_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of test examples to this "
+            "value if set."
+        },
+    )
+    label_all_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to put the label for one word on all tokens of generated by that word or just on the "
+            "one (in which case the other tokens will have a padding index)."
+        },
+    )
+    return_entity_level_metrics: bool = field(
+        default=False,
+        metadata={"help": "Whether to return all the entity levels during evaluation or just the overall ones."},
+    )
     segment_level_layout: bool = field(default=True)
     visual_embed: bool = field(default=True)
-    use_segment_head: bool = field(default=False)
+    use_segment_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Use LayoutLMv3ForSegmentTokenClassification (segment-level pooling + "
+            "inter-segment context head) instead of the vanilla per-token classification head."
+        },
+    )
 
-    # ---- THAM SỐ ABLATION ----
+    # ---------------- ABLATION FLAGS ----------------
+    # These were missing before: the CLI rejected --segment_context_layers and
+    # nothing was ever written to `config`, so the model always fell back to
+    # getattr(config, "segment_context_layers", 1) == 1. Both flags below are
+    # now parsed AND pushed onto the config object further down in main().
     segment_context_layers: int = field(
         default=1,
-        metadata={"help": "Ablation test: 0 = Tắt Transformer context, 1 = Bật Transformer context."}
+        metadata={"help": "0 = no inter-segment Transformer (pooling/broadcast only). "
+                          "1+ = number of TransformerEncoder layers over the segment sequence."},
     )
-    # PATCH: tách riêng khỏi segment_context_layers -- False = tắt positional
-    # embedding cho segment_context NGAY CẢ KHI layers>0, để cô lập đúng đóng
-    # góp của self-attention thuần (không biết thứ tự) so với việc biết thứ
-    # tự đọc. Trước đây layers=0 kéo tắt luôn position embedding -> confound
-    # khi so sánh ctx=0 vs ctx=1.
     segment_use_position_embedding: bool = field(
         default=True,
-        metadata={"help": "False = tắt positional embedding cho segment_context "
-                  "độc lập với segment_context_layers, để cô lập đóng góp của "
-                  "self-attention thuần khỏi đóng góp của biết-thứ-tự-đọc."}
+        metadata={"help": "Segment reading-order positional embedding, controlled INDEPENDENTLY of "
+                          "segment_context_layers so that a ctx=0 vs ctx=1 comparison isolates the "
+                          "self-attention contribution instead of also removing the order signal."},
     )
+    segment_context_heads: int = field(
+        default=4, metadata={"help": "Attention heads in the inter-segment Transformer."}
+    )
+    segment_context_max_positions: int = field(
+        default=128, metadata={"help": "Max number of segments covered by the segment positional embedding."}
+    )
+    new_params_lr: float = field(
+        default=5e-4,
+        metadata={"help": "Separate (higher) learning rate for the newly added modules "
+                          "(segment_context, classifier, embeddings, gate). The backbone uses "
+                          "--learning_rate. Exposed as a flag because this value was previously "
+                          "hard-coded, which made LR changes invisible in the run command."},
+    )
+    # ------------------------------------------------
 
     data_dir: Optional[str] = field(default=None)
-    input_size: int = field(default=224)
-    second_input_size: int = field(default=112)
-    train_interpolation: str = field(default='bicubic')
-    second_interpolation: str = field(default='lanczos')
-    imagenet_default_mean_and_std: bool = field(default=False)
+    input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
+    second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
+    train_interpolation: str = field(
+        default='bicubic', metadata={"help": "Training interpolation (random, bilinear, bicubic)"})
+    second_interpolation: str = field(
+        default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
+    imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
 
 
-# ---- PATCH: log giá trị segment_context_gate và token_gate mỗi lần eval.
-# Không phụ thuộc seed/nhiễu train -- xem giá trị này TRƯỚC KHI tin vào
-# chênh lệch F1 giữa các run, theo đúng thảo luận: gate gần 0 sau train
-# nghĩa là CHÍNH MODEL tự quyết định context vô dụng, độc lập với nhiễu F1.
 class GateLoggingCallback(TrainerCallback):
+    """Logs segment_context_gate at every eval.
+
+    Why this matters: the gate multiplies the ENTIRE Transformer contribution
+    (seg_vecs + gate * (ctx_out - seg_vecs)). If it converges to ~0, the
+    Transformer is effectively switched off, and any downstream ablation
+    (shuffling segment order / membership) will trivially show no effect --
+    which must not be misread as "the Transformer ignores that structure".
+    Watching the gate during training tells you this directly, independently
+    of run-to-run F1 noise.
+    """
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None:
             return
-        msgs = []
-        if getattr(model, "segment_context_gate", None) is not None:
-            msgs.append(f"segment_context_gate={model.segment_context_gate.item():.4f}")
-        if getattr(model, "token_gate", None) is not None:
-            msgs.append(f"token_gate={model.token_gate.item():.4f}")
-        if msgs:
-            logger.info(f"[GateLoggingCallback] step={state.global_step} " + " ".join(msgs))
+        inner = model.module if hasattr(model, "module") else model
+        gate = getattr(inner, "segment_context_gate", None)
+        if gate is not None:
+            logger.info(f"[GateLogging] step={state.global_step} segment_context_gate={gate.item():+.6f}")
 
 
 def main():
+    # See all possible arguments in layoutlmft/transformers/training_args.py
+    # or by passing the --help flag to this script.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
 
+    # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -122,11 +244,17 @@ def main():
     )
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
     if is_main_process(training_args.local_rank):
         transformers.utils.logging.set_verbosity_info()
         transformers.utils.logging.enable_default_handler()
         transformers.utils.logging.enable_explicit_format()
+    logger.info(f"Training/evaluation parameters {training_args}")
 
+    # Set seed before initializing model.
     set_seed(training_args.seed)
 
     if data_args.dataset_name == 'funsd':
@@ -146,7 +274,11 @@ def main():
         features = datasets["test"].features
 
     text_column_name = "words" if "words" in column_names else "tokens"
-    label_column_name = (f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1])
+
+    label_column_name = (
+        f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1]
+    )
+
     remove_columns = column_names
 
     def get_label_list(labels):
@@ -175,13 +307,26 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    # ---- ĐẨY THAM SỐ VÀO CẤU HÌNH ----
-    config.segment_context_layers = getattr(data_args, "segment_context_layers", 1)
-    config.segment_use_position_embedding = getattr(data_args, "segment_use_position_embedding", True)
+    # ---- PUSH ABLATION FLAGS ONTO THE CONFIG ----
+    # Without these lines the model silently ignores the CLI flags and always
+    # builds the default 1-layer Transformer with positional embedding on.
+    # They are also saved into the checkpoint's config.json, so any later eval
+    # script reconstructs the exact same architecture.
+    config.segment_context_layers = data_args.segment_context_layers
+    config.segment_use_position_embedding = data_args.segment_use_position_embedding
+    config.segment_context_heads = data_args.segment_context_heads
+    config.segment_context_max_positions = data_args.segment_context_max_positions
+    if data_args.use_segment_head:
+        logger.info(
+            f"[SegmentHead] segment_context_layers={config.segment_context_layers} "
+            f"segment_use_position_embedding={config.segment_use_position_embedding} "
+            f"segment_context_heads={config.segment_context_heads} "
+            f"new_params_lr={data_args.new_params_lr}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        tokenizer_file=None,
+        tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
         cache_dir=model_args.cache_dir,
         use_fast=True,
         add_prefix_space=True,
@@ -190,7 +335,9 @@ def main():
     )
 
     if getattr(data_args, "use_segment_head", False):
-        from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import LayoutLMv3ForSegmentTokenClassification
+        from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
+            LayoutLMv3ForSegmentTokenClassification,
+        )
         model = LayoutLMv3ForSegmentTokenClassification.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -209,6 +356,15 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
+    # Tokenizer check: this script requires a fast tokenizer.
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        raise ValueError(
+            "This example script only works for models that have a fast tokenizer. Checkout the big table of models "
+            "at https://huggingface.co/transformers/index.html#bigtable to find the model types that meet this "
+            "requirement"
+        )
+
+    # Preprocessing the dataset
     padding = "max_length" if data_args.pad_to_max_length else False
 
     if data_args.visual_embed:
@@ -216,13 +372,17 @@ def main():
         mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN
         std = IMAGENET_INCEPTION_STD if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_STD
         common_transform = Compose([
-            RandomResizedCropAndInterpolationWithTwoPic(size=data_args.input_size, interpolation=data_args.train_interpolation),
+            RandomResizedCropAndInterpolationWithTwoPic(
+                size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
         patch_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=torch.tensor(mean), std=torch.tensor(std))
+            transforms.Normalize(
+                mean=torch.tensor(mean),
+                std=torch.tensor(std))
         ])
 
+    # Tokenize all texts and align the labels with them.
     def tokenize_and_align_labels(examples, augmentation=False):
         tokenized_inputs = tokenizer(
             examples[text_column_name],
@@ -235,7 +395,7 @@ def main():
         labels = []
         bboxes = []
         images = []
-        seg_ids = []
+        seg_ids = []  # per-token local segment index
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -243,6 +403,12 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
+            # Recover the original FUNSD/CORD "item" (= segment) boundaries.
+            # funsd.py/cord.py assign an IDENTICAL item-level bbox to every
+            # word belonging to the same item, so grouping consecutive words
+            # with the same bbox tuple reconstructs the gold segment groups.
+            # Only computed when --use_segment_head is set, so the vanilla
+            # baseline never receives this extra batch key.
             word_seg_id = None
             if getattr(data_args, "use_segment_head", False):
                 word_seg_id = []
@@ -260,11 +426,13 @@ def main():
             bbox_inputs = []
             seg_id_inputs = []
             for word_idx in word_ids:
+                # Special tokens have a word id that is None -> label -100 so
+                # they are ignored in the loss.
                 if word_idx is None:
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(-1)
+                        seg_id_inputs.append(-1)  # not part of any segment
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
@@ -298,6 +466,8 @@ def main():
         return tokenized_inputs
 
     if training_args.do_train:
+        if "train" not in datasets:
+            raise ValueError("--do_train requires a train dataset")
         train_dataset = datasets["train"]
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
@@ -310,7 +480,10 @@ def main():
         )
 
     if training_args.do_eval:
-        eval_dataset = datasets["test"]
+        validation_name = "test"
+        if validation_name not in datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = datasets[validation_name]
         if data_args.max_val_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
         eval_dataset = eval_dataset.map(
@@ -322,6 +495,8 @@ def main():
         )
 
     if training_args.do_predict:
+        if "test" not in datasets:
+            raise ValueError("--do_predict requires a test dataset")
         test_dataset = datasets["test"]
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
@@ -333,6 +508,7 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
+    # Data collator
     data_collator = DataCollatorForKeyValueExtraction(
         tokenizer,
         pad_to_multiple_of=8 if training_args.fp16 else None,
@@ -340,12 +516,14 @@ def main():
         max_length=512,
     )
 
+    # Metrics
     metric = evaluate.load("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
         predictions = np.argmax(predictions, axis=2)
 
+        # Remove ignored index (special tokens)
         true_predictions = [
             [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
             for prediction, label in zip(predictions, labels)
@@ -373,15 +551,18 @@ def main():
                 "accuracy": results["overall_accuracy"],
             }
 
+    # Custom Trainer: separate learning rate for the newly added modules.
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                backbone_params = [p for n, p in self.model.named_parameters()
+                                   if "layoutlmv3" in n and p.requires_grad]
+                new_params = [p for n, p in self.model.named_parameters()
+                              if "layoutlmv3" not in n and p.requires_grad]
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
-                    {"params": new_params, "lr": 1e-4}
+                    {"params": new_params, "lr": data_args.new_params_lr},
                 ]
 
                 self.optimizer = torch.optim.AdamW(
@@ -402,27 +583,43 @@ def main():
         callbacks=[GateLoggingCallback()] if getattr(data_args, "use_segment_head", False) else None,
     )
 
+    # Training
     if training_args.do_train:
         checkpoint = last_checkpoint if last_checkpoint else None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
-        trainer.save_model()
+        trainer.save_model()  # Saves the tokenizer too for easy upload
 
-        max_train_samples = (data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset))
+        max_train_samples = (
+            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+        )
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
+    # Evaluation
     if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+
         metrics = trainer.evaluate()
+
         max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
+
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
+        inner = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        gate = getattr(inner, "segment_context_gate", None)
+        if gate is not None:
+            logger.info(f"[Final] segment_context_gate = {gate.item():+.6f}")
+
+    # Predict
     if training_args.do_predict:
+        logger.info("*** Predict ***")
+
         predictions, labels, metrics = trainer.predict(test_dataset)
         predictions = np.argmax(predictions, axis=2)
 
@@ -439,6 +636,12 @@ def main():
             with open(output_test_predictions_file, "w") as writer:
                 for prediction in true_predictions:
                     writer.write(" ".join(prediction) + "\n")
+
+
+def _mp_fn(index):
+    # For xla_spawn (TPUs)
+    main()
+
 
 if __name__ == "__main__":
     main()
