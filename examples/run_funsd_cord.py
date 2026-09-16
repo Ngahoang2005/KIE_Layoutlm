@@ -19,6 +19,7 @@ from transformers import (
     HfArgumentParser,
     PreTrainedTokenizerFast,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -60,19 +61,48 @@ class DataTrainingArguments:
     segment_level_layout: bool = field(default=True)
     visual_embed: bool = field(default=True)
     use_segment_head: bool = field(default=False)
-    
-    # ---- THAM SỐ ABLATION MỚI ĐƯỢC THÊM VÀO ----
+
+    # ---- THAM SỐ ABLATION ----
     segment_context_layers: int = field(
         default=1,
         metadata={"help": "Ablation test: 0 = Tắt Transformer context, 1 = Bật Transformer context."}
     )
-    
+    # PATCH: tách riêng khỏi segment_context_layers -- False = tắt positional
+    # embedding cho segment_context NGAY CẢ KHI layers>0, để cô lập đúng đóng
+    # góp của self-attention thuần (không biết thứ tự) so với việc biết thứ
+    # tự đọc. Trước đây layers=0 kéo tắt luôn position embedding -> confound
+    # khi so sánh ctx=0 vs ctx=1.
+    segment_use_position_embedding: bool = field(
+        default=True,
+        metadata={"help": "False = tắt positional embedding cho segment_context "
+                  "độc lập với segment_context_layers, để cô lập đóng góp của "
+                  "self-attention thuần khỏi đóng góp của biết-thứ-tự-đọc."}
+    )
+
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224)
     second_input_size: int = field(default=112)
     train_interpolation: str = field(default='bicubic')
     second_interpolation: str = field(default='lanczos')
     imagenet_default_mean_and_std: bool = field(default=False)
+
+
+# ---- PATCH: log giá trị segment_context_gate và token_gate mỗi lần eval.
+# Không phụ thuộc seed/nhiễu train -- xem giá trị này TRƯỚC KHI tin vào
+# chênh lệch F1 giữa các run, theo đúng thảo luận: gate gần 0 sau train
+# nghĩa là CHÍNH MODEL tự quyết định context vô dụng, độc lập với nhiễu F1.
+class GateLoggingCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        msgs = []
+        if getattr(model, "segment_context_gate", None) is not None:
+            msgs.append(f"segment_context_gate={model.segment_context_gate.item():.4f}")
+        if getattr(model, "token_gate", None) is not None:
+            msgs.append(f"token_gate={model.token_gate.item():.4f}")
+        if msgs:
+            logger.info(f"[GateLoggingCallback] step={state.global_step} " + " ".join(msgs))
+
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
@@ -144,9 +174,10 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    
-    # ---- ĐẨY THAM SỐ VÀO CẤU HÌNH ĐỂ MÔ HÌNH NHẬN DIỆN ----
+
+    # ---- ĐẨY THAM SỐ VÀO CẤU HÌNH ----
     config.segment_context_layers = getattr(data_args, "segment_context_layers", 1)
+    config.segment_use_position_embedding = getattr(data_args, "segment_use_position_embedding", True)
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -204,7 +235,7 @@ def main():
         labels = []
         bboxes = []
         images = []
-        seg_ids = []  
+        seg_ids = []
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -227,28 +258,28 @@ def main():
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []  
+            seg_id_inputs = []
             for word_idx in word_ids:
                 if word_idx is None:
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(-1)  
+                        seg_id_inputs.append(-1)
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  
+                        seg_id_inputs.append(word_seg_id[word_idx])
                 else:
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  
+                        seg_id_inputs.append(word_seg_id[word_idx])
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)  
+                seg_ids.append(seg_id_inputs)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -260,7 +291,7 @@ def main():
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids  
+            tokenized_inputs["seg_id"] = seg_ids
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -349,12 +380,12 @@ def main():
                 new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, 
+                    {"params": backbone_params, "lr": self.args.learning_rate},
                     {"params": new_params, "lr": 1e-4}
                 ]
-                
+
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )
@@ -368,13 +399,14 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[GateLoggingCallback()] if getattr(data_args, "use_segment_head", False) else None,
     )
 
     if training_args.do_train:
         checkpoint = last_checkpoint if last_checkpoint else None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
-        trainer.save_model()  
+        trainer.save_model()
 
         max_train_samples = (data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset))
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
