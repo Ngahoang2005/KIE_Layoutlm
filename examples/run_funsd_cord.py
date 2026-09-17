@@ -62,27 +62,16 @@ class DataTrainingArguments:
     visual_embed: bool = field(default=True)
     use_segment_head: bool = field(default=False)
 
-    segment_context_layers: int = field(
-        default=1,
-        metadata={"help": "Ablation test: 0 = Tat Transformer context, 1 = Bat Transformer context."}
-    )
-    # ---- PATCH v6: GRUGate (GTrXL-style), thay the length-conditional
-    # gate va spatial-embedding-lon da that bai (xem lich su trong
-    # modeling_layoutlmv3_segment.py docstring). ----
-    segment_use_token_gru_gate: bool = field(
-        default=True,
-        metadata={"help": "True = dung GRUGate (residual gate hoc tu noi "
-                  "dung, per-token per-chieu) giua per-token hidden goc va "
-                  "pooled_hidden. False = ghi de vo dieu kien (ban v3 cu)."}
-    )
-    segment_gate_bottleneck: int = field(
-        default=64,
-        metadata={"help": "Chieu bottleneck cho GRUGate -- kiem soat so "
-                  "tham so moi tren tap du lieu nho (149 van ban FUNSD)."}
-    )
-    segment_debug: bool = field(
-        default=False,
-        metadata={"help": "Bat debug print o forward dau tien, 1 lan."}
+    segment_context_layers: int = field(default=1)
+    segment_use_spatial_embed: bool = field(default=True)
+    segment_use_length_gate: bool = field(default=True)
+    segment_spatial_buckets: int = field(default=32)
+    segment_debug: bool = field(default=False)
+    
+    # FIX LR: Thêm cờ chỉnh LR riêng cho tham số mới từ Bash
+    new_params_lr: float = field(
+        default=2e-4, 
+        metadata={"help": "Learning rate for newly initialized parameters."}
     )
 
     data_dir: Optional[str] = field(default=None)
@@ -94,20 +83,18 @@ class DataTrainingArguments:
 
 
 class GateLoggingCallback(TrainerCallback):
-    """Log gia tri gate moi lan eval -- khong phu thuoc seed/nhieu train,
-    xem TRUOC KHI tin vao chenh lech F1 giua cac run."""
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None:
             return
         msgs = []
         if getattr(model, "segment_context_gate", None) is not None:
             msgs.append(f"segment_context_gate={model.segment_context_gate.item():.4f}")
-        if getattr(model, "token_gru_gate", None) is not None:
-            with torch.no_grad():
-                bg_mean = model.token_gru_gate.bg.mean().item()
-                bg_std = model.token_gru_gate.bg.std().item()
-            msgs.append(f"gru_gate_bias_mean={bg_mean:.4f}(std={bg_std:.4f}) "
-                        f"[thap hon init(2.0) -> gate dang mo ra, tin pooled_hidden nhieu hon]")
+        if getattr(model, "seg_len_gate_threshold", None) is not None:
+            msgs.append(f"seg_len_threshold={model.seg_len_gate_threshold.item():.4f}")
+        if getattr(model, "seg_len_gate_slope", None) is not None:
+            slope_raw = model.seg_len_gate_slope.item()
+            slope_clamped = max(0.05, min(2.0, slope_raw))
+            msgs.append(f"seg_len_slope={slope_raw:.4f}(clamped={slope_clamped:.4f})")
         if msgs:
             logger.info(f"[GateLoggingCallback] step={state.global_step} " + " ".join(msgs))
 
@@ -184,8 +171,9 @@ def main():
     )
 
     config.segment_context_layers = getattr(data_args, "segment_context_layers", 1)
-    config.segment_use_token_gru_gate = getattr(data_args, "segment_use_token_gru_gate", True)
-    config.segment_gate_bottleneck = getattr(data_args, "segment_gate_bottleneck", 64)
+    config.segment_use_spatial_embed = getattr(data_args, "segment_use_spatial_embed", True)
+    config.segment_use_length_gate = getattr(data_args, "segment_use_length_gate", True)
+    config.segment_spatial_buckets = getattr(data_args, "segment_spatial_buckets", 32)
     config.segment_debug = getattr(data_args, "segment_debug", False)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -388,9 +376,12 @@ def main():
                 backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
                 new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
 
+                # FIX LR: Sử dụng tốc độ học 2e-4 (chậm lại để không rớt ở cuối)
+                lr_new = getattr(self.args, "new_params_lr", 2e-4)
+
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
-                    {"params": new_params, "lr": 1e-4}
+                    {"params": new_params, "lr": lr_new}
                 ]
 
                 self.optimizer = torch.optim.AdamW(
