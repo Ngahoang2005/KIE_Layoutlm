@@ -3,29 +3,32 @@
 """
 LayoutLMv3ForSegmentTokenClassification
 
-[PATCH v4 -- dua tren ket qua ablation T1-T6 + Run D/E, chuyen han sang
-GOLD annotation, khong con lo phong thu truoc segmentation nhieu]
+[PATCH v5 -- CO LAP 2 thay doi cua v4 (2D spatial embedding, length-
+conditional gate) thanh 2 co RIENG BIET, vi v4-full lam F1 GIAM (91.41 ->
+90.08, recall giam manh nhat -1.85) va khong biet chinh xac thanh phan nao
+gay hai. Gio co the bat/tat tung phan doc lap de co lap nguyen nhan.
 
-Hai cai tien rut ra truc tiep tu du lieu ablation:
+Config flags moi (default = GIONG v4 full, doi rieng tung cai khi ablation):
+  segment_use_spatial_embed (bool, default True)
+      True  -> dung 2D spatial embedding (toa do tam segment, bucket-hoa)
+      False -> dung LAI order-based position embedding (ban v3 cu, dua
+               vao arange(n_seg))
+  segment_use_length_gate (bool, default True)
+      True  -> gate = segment_context_gate * sigmoid((seg_len-threshold)*slope)
+      False -> gate = segment_context_gate (scalar thuong, ban v3 cu)
+  segment_spatial_buckets (int, default 32)
+      Da giam tu 1024 (v4) xuong 32 -- 1024 bucket ~1.6M tham so moi qua
+      lon so voi 149 van ban train, nghi ngo la nguyen nhan chinh gay F1
+      giam (chua hoc noi bieu dien co nghia, phat nhieu thay vi tin hieu).
+  segment_debug (bool, default False)
+      Bat debug print (shape/gia tri mau) o step dau tien cua forward,
+      chi 1 lan, de kiem tra nhanh khong can cho het training.
 
-  1. THAY position embedding theo THU TU DOC (segment_position_embedding,
-     index bang arange(n_seg)) bang 2D SPATIAL EMBEDDING theo TOA DO TAM
-     THAT cua tung segment.
-     Ly do: T4 (xao thu tu segment luc test) -> F1 khong doi (91.41+-0.09).
-     Run E (bo han position embedding luc train) -> F1 giam 0.99 diem.
-     => model dang dung no nhu THE DINH DANH pha doi xung, KHONG dung nhu
-     thu tu doc thuc su. Doi sang toa do that tan dung dung tin hieu hinh
-     hoc (segment nay o tren/duoi/trai/phai segment kia), thay vi lang phi
-     slot tham so cho 1 tin hieu ma model khong dung dung muc dich.
-
-  2. LENGTH-CONDITIONAL GATE: nhan segment_context_gate voi 1 he so phu
-     thuoc SO TU trong segment (sigmoid theo threshold/slope hoc duoc).
-     Ly do: case study cho thay Transformer sua dung 50 token nhung lam
-     sai them 52 -- over-smoothing khong chon loc, ap dung deu cho moi
-     segment ke ca segment ngan von da du tin hieu per-token. Length-
-     conditional gate cho phep model tu hoc "segment ngan -> tin it vao
-     context, segment dai -> tin nhieu" thay vi 1 gate scalar toan cuc.
+Giu nguyen eval_shuffle_mode (order/membership) tu ban truoc -- van dung
+duoc cho T4/T5-style ablation neu can, khong anh huong hanh vi mac dinh.
 """
+import os
+
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
@@ -36,6 +39,12 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
+
+
+def _is_main_process():
+    # Tranh spam print khi chay DDP nhieu process (--nproc_per_node=2)
+    return int(os.environ.get("LOCAL_RANK", 0)) == 0
+
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -56,6 +65,12 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
 
+        # ---- Co doc lap (PATCH v5) ----
+        self.use_spatial_embed = getattr(config, "segment_use_spatial_embed", True)
+        self.use_length_gate = getattr(config, "segment_use_length_gate", True)
+        self.debug_mode = getattr(config, "segment_debug", False)
+        self._debug_printed = False
+
         if seg_ctx_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
@@ -67,51 +82,75 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
 
-            n_buckets = getattr(config, "segment_spatial_buckets", 1024)
-            self.segment_x_embedding = nn.Embedding(n_buckets, config.hidden_size)
-            self.segment_y_embedding = nn.Embedding(n_buckets, config.hidden_size)
-            nn.init.normal_(self.segment_x_embedding.weight, mean=0.0, std=0.02)
-            nn.init.normal_(self.segment_y_embedding.weight, mean=0.0, std=0.02)
-            self._spatial_n_buckets = n_buckets
+            # ---- Nhanh A: order-based position embedding (v3 cu) ----
+            if not self.use_spatial_embed:
+                max_pos = getattr(config, "segment_context_max_positions", 128)
+                self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
+                nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+                self.segment_x_embedding = None
+                self.segment_y_embedding = None
+            # ---- Nhanh B: 2D spatial embedding (v4 moi, bucket giam con 32) ----
+            else:
+                n_buckets = getattr(config, "segment_spatial_buckets", 32)
+                self.segment_x_embedding = nn.Embedding(n_buckets, config.hidden_size)
+                self.segment_y_embedding = nn.Embedding(n_buckets, config.hidden_size)
+                nn.init.normal_(self.segment_x_embedding.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.segment_y_embedding.weight, mean=0.0, std=0.02)
+                self._spatial_n_buckets = n_buckets
+                self.segment_position_embedding = None
         else:
             self.segment_context = None
             self.segment_context_gate = None
+            self.segment_position_embedding = None
             self.segment_x_embedding = None
             self.segment_y_embedding = None
 
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
-        if seg_ctx_layers > 0:
-            # PATCH: hieu chinh lai gia tri khoi tao theo so lieu thuc te tu
-            # probe_segment_context.py -- median segment SUA DUNG = 9.0 tu,
-            # median segment LAM SAI = 5.0 tu. Threshold=3.0 (gia tri doan
-            # truoc, CHUA co so lieu) dat qua thap: tai seg_len=5 (dung
-            # nhom can bi chan), sigmoid((5-3)*1)=0.88 -- gan nhu KHONG chan
-            # gi ca, di nguoc lai muc dich thiet ke. Doi threshold ve diem
-            # giua 2 median (7.0) de co chan dung nhom can chan tu dau,
-            # thay vi bat model tu hoc lai tu 1 diem khoi tao sai lech xa.
+        # ---- Length-conditional gate (chi tao tham so khi bat) ----
+        if seg_ctx_layers > 0 and self.use_length_gate:
+            # threshold=7.0: hieu chinh theo so lieu that (median SUA DUNG=9,
+            # median LAM SAI=5, diem giua=7) -- xem thao luan truoc.
             self.seg_len_gate_threshold = nn.Parameter(torch.tensor(7.0))
             self.seg_len_gate_slope = nn.Parameter(torch.tensor(1.0))
         else:
             self.seg_len_gate_threshold = None
             self.seg_len_gate_slope = None
 
+        # None | "order" | "membership" -- dat tu ben ngoai truoc khi eval,
+        # dung cho T4/T5-style ablation, khong anh huong hanh vi mac dinh.
+        self.eval_shuffle_mode = None
+
         self.init_weights()
+
+        if _is_main_process():
+            print(
+                f"[LayoutLMv3ForSegmentTokenClassification] segment_context_layers={seg_ctx_layers} "
+                f"use_spatial_embed={self.use_spatial_embed} use_length_gate={self.use_length_gate} "
+                f"spatial_buckets={getattr(config, 'segment_spatial_buckets', 32) if self.use_spatial_embed else None}"
+            )
 
     def _bbox_to_bucket(self, coord_0_1000):
         idx = (coord_0_1000.clamp(0, 1000) / 1000.0 * (self._spatial_n_buckets - 1)).long()
         return idx
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id, bbox):
-        """bbox: (B, L, 4) [x0,y0,x1,y1] scale 0-1000, phan TEXT (khop voi
-        text_hidden), dung de tinh tam moi segment."""
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
 
+        debug_this_call = self.debug_mode and not self._debug_printed and _is_main_process()
+
         for b in range(B):
-            ids = seg_id[b]
+            ids = seg_id[b].clone()
+
+            if self.eval_shuffle_mode == "membership" and not self.training:
+                valid_mask = ids >= 0
+                valid_ids = ids[valid_mask]
+                perm = torch.randperm(valid_ids.shape[0], device=device)
+                ids[valid_mask] = valid_ids[perm]
+
             valid = ids >= 0
             if valid.sum() == 0:
                 continue
@@ -129,25 +168,71 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
                 seg_lens[i] = mask.sum().float()
-                member_boxes = bbox[b, mask].float()
-                cx = (member_boxes[:, 0] + member_boxes[:, 2]) / 2
-                cy = (member_boxes[:, 1] + member_boxes[:, 3]) / 2
-                seg_cx[i] = cx.mean()
-                seg_cy[i] = cy.mean()
+                if self.use_spatial_embed and bbox is not None:
+                    member_boxes = bbox[b, mask].float()
+                    cx = (member_boxes[:, 0] + member_boxes[:, 2]) / 2
+                    cy = (member_boxes[:, 1] + member_boxes[:, 3]) / 2
+                    seg_cx[i] = cx.mean()
+                    seg_cy[i] = cy.mean()
+
+            order_perm = None
+            if self.eval_shuffle_mode == "order" and not self.training and n_seg > 1:
+                order_perm = torch.randperm(n_seg, device=device)
+                seg_vecs_input = seg_vecs[order_perm]
+            else:
+                seg_vecs_input = seg_vecs
 
             if self.segment_context is not None:
-                x_bucket = self._bbox_to_bucket(seg_cx)
-                y_bucket = self._bbox_to_bucket(seg_cy)
-                spatial_embed = self.segment_x_embedding(x_bucket) + self.segment_y_embedding(y_bucket)
-                seg_vecs_with_pos = seg_vecs + spatial_embed
+                # ---- Nhanh A/B: chon nguon "vi tri" theo co use_spatial_embed ----
+                if self.use_spatial_embed:
+                    x_bucket = self._bbox_to_bucket(seg_cx)
+                    y_bucket = self._bbox_to_bucket(seg_cy)
+                    pos_embed = self.segment_x_embedding(x_bucket) + self.segment_y_embedding(y_bucket)
+                    if order_perm is not None:
+                        pos_embed = pos_embed[order_perm]
+                else:
+                    max_pos = self.segment_position_embedding.num_embeddings
+                    positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
+                    pos_embed = self.segment_position_embedding(positions)
 
+                seg_vecs_with_pos = seg_vecs_input + pos_embed
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
 
-                length_factor = torch.sigmoid(
-                    (seg_lens - self.seg_len_gate_threshold) * self.seg_len_gate_slope
-                )
-                effective_gate = self.segment_context_gate * length_factor.unsqueeze(-1)
+                if order_perm is not None:
+                    inv_perm = torch.empty_like(order_perm)
+                    inv_perm[order_perm] = torch.arange(n_seg, device=device)
+                    ctx_out = ctx_out[inv_perm]
+
+                # ---- Nhanh A/B: gate thuong hay length-conditional ----
+                if self.use_length_gate:
+                    length_factor = torch.sigmoid(
+                        (seg_lens - self.seg_len_gate_threshold)
+                        * torch.clamp(self.seg_len_gate_slope, min=0.05, max=2.0)
+                    )
+                    effective_gate = self.segment_context_gate * length_factor.unsqueeze(-1)
+                else:
+                    effective_gate = self.segment_context_gate
+
                 seg_vecs_ctx = seg_vecs + effective_gate * (ctx_out - seg_vecs)
+
+                if debug_this_call and b == 0:
+                    print("=" * 60)
+                    print("[DEBUG segment_pool] batch0, n_seg =", n_seg)
+                    print("  seg_lens        :", seg_lens.tolist()[:10], "...")
+                    if self.use_spatial_embed:
+                        print("  seg_cx (0-1000) :", seg_cx.tolist()[:10], "...")
+                        print("  seg_cy (0-1000) :", seg_cy.tolist()[:10], "...")
+                        print("  x_bucket        :", x_bucket.tolist()[:10], "...")
+                        print("  y_bucket        :", y_bucket.tolist()[:10], "...")
+                    if self.use_length_gate:
+                        print("  threshold =", self.seg_len_gate_threshold.item(),
+                              " slope =", self.seg_len_gate_slope.item())
+                        print("  length_factor   :", length_factor.tolist()[:10], "...")
+                    print("  segment_context_gate =", self.segment_context_gate.item())
+                    print("  ||ctx_out - seg_vecs|| / ||seg_vecs|| =",
+                          ((ctx_out - seg_vecs).norm() / (seg_vecs.norm() + 1e-9)).item())
+                    print("=" * 60)
+                    self._debug_printed = True
             else:
                 seg_vecs_ctx = seg_vecs
 
