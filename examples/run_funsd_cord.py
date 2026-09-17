@@ -398,7 +398,7 @@ def main():
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
-                    {"params": new_params, "lr": 1e-4}
+                    {"params": new_params, "lr": 5e-4}
                 ]
 
                 self.optimizer = torch.optim.AdamW(
