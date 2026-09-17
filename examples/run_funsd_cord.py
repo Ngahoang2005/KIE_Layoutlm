@@ -62,33 +62,27 @@ class DataTrainingArguments:
     visual_embed: bool = field(default=True)
     use_segment_head: bool = field(default=False)
 
-    # ---- THAM SO ABLATION ----
     segment_context_layers: int = field(
         default=1,
         metadata={"help": "Ablation test: 0 = Tat Transformer context, 1 = Bat Transformer context."}
     )
-    # ---- PATCH v5: co lap 2 thay doi cua v4 (2D spatial embed, length gate) ----
-    segment_use_spatial_embed: bool = field(
+    # ---- PATCH v6: GRUGate (GTrXL-style), thay the length-conditional
+    # gate va spatial-embedding-lon da that bai (xem lich su trong
+    # modeling_layoutlmv3_segment.py docstring). ----
+    segment_use_token_gru_gate: bool = field(
         default=True,
-        metadata={"help": "True = dung 2D spatial embedding (toa do tam segment). "
-                  "False = dung LAI order-based position embedding (ban v3 cu)."}
+        metadata={"help": "True = dung GRUGate (residual gate hoc tu noi "
+                  "dung, per-token per-chieu) giua per-token hidden goc va "
+                  "pooled_hidden. False = ghi de vo dieu kien (ban v3 cu)."}
     )
-    segment_use_length_gate: bool = field(
-        default=True,
-        metadata={"help": "True = length-conditional gate (sigmoid theo so tu/segment). "
-                  "False = gate scalar thuong (ban v3 cu)."}
-    )
-    segment_spatial_buckets: int = field(
-        default=32,
-        metadata={"help": "So bucket cho 2D spatial embedding (chi dung khi "
-                  "segment_use_spatial_embed=True). Da giam tu 1024 (v4) "
-                  "xuong 32 -- nghi ngo 1024 qua nhieu tham so cho 149 van "
-                  "ban train, gay F1 giam."}
+    segment_gate_bottleneck: int = field(
+        default=64,
+        metadata={"help": "Chieu bottleneck cho GRUGate -- kiem soat so "
+                  "tham so moi tren tap du lieu nho (149 van ban FUNSD)."}
     )
     segment_debug: bool = field(
         default=False,
-        metadata={"help": "Bat debug print (shape/gia tri mau) o forward dau "
-                  "tien, 1 lan duy nhat -- kiem tra nhanh khong can cho het train."}
+        metadata={"help": "Bat debug print o forward dau tien, 1 lan."}
     )
 
     data_dir: Optional[str] = field(default=None)
@@ -100,20 +94,20 @@ class DataTrainingArguments:
 
 
 class GateLoggingCallback(TrainerCallback):
-    """Log gia tri gate/threshold/slope moi lan eval -- khong phu thuoc
-    seed/nhieu train, xem TRUOC KHI tin vao chenh lech F1 giua cac run."""
+    """Log gia tri gate moi lan eval -- khong phu thuoc seed/nhieu train,
+    xem TRUOC KHI tin vao chenh lech F1 giua cac run."""
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None:
             return
         msgs = []
         if getattr(model, "segment_context_gate", None) is not None:
             msgs.append(f"segment_context_gate={model.segment_context_gate.item():.4f}")
-        if getattr(model, "seg_len_gate_threshold", None) is not None:
-            msgs.append(f"seg_len_threshold={model.seg_len_gate_threshold.item():.4f}")
-        if getattr(model, "seg_len_gate_slope", None) is not None:
-            slope_raw = model.seg_len_gate_slope.item()
-            slope_clamped = max(0.05, min(2.0, slope_raw))
-            msgs.append(f"seg_len_slope={slope_raw:.4f}(clamped={slope_clamped:.4f})")
+        if getattr(model, "token_gru_gate", None) is not None:
+            with torch.no_grad():
+                bg_mean = model.token_gru_gate.bg.mean().item()
+                bg_std = model.token_gru_gate.bg.std().item()
+            msgs.append(f"gru_gate_bias_mean={bg_mean:.4f}(std={bg_std:.4f}) "
+                        f"[thap hon init(2.0) -> gate dang mo ra, tin pooled_hidden nhieu hon]")
         if msgs:
             logger.info(f"[GateLoggingCallback] step={state.global_step} " + " ".join(msgs))
 
@@ -189,11 +183,9 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    # ---- DAY THAM SO VAO CAU HINH ----
     config.segment_context_layers = getattr(data_args, "segment_context_layers", 1)
-    config.segment_use_spatial_embed = getattr(data_args, "segment_use_spatial_embed", True)
-    config.segment_use_length_gate = getattr(data_args, "segment_use_length_gate", True)
-    config.segment_spatial_buckets = getattr(data_args, "segment_spatial_buckets", 32)
+    config.segment_use_token_gru_gate = getattr(data_args, "segment_use_token_gru_gate", True)
+    config.segment_gate_bottleneck = getattr(data_args, "segment_gate_bottleneck", 64)
     config.segment_debug = getattr(data_args, "segment_debug", False)
 
     tokenizer = AutoTokenizer.from_pretrained(
