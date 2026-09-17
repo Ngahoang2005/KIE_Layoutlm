@@ -1,42 +1,6 @@
-#layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
+# layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
 # coding=utf-8
-"""
-LayoutLMv3ForSegmentTokenClassification
-
-[PATCH v6 -- PHUONG AN CUOI, sau khi 2 huong truoc that bai co kiem chung]
-
-Lich su ngan gon (de nguoi doc sau nay hieu vi sao thiet ke nhu the nay):
-  - v3 (nen goc): order-based position embedding + segment_context_gate
-    (scalar). F1 = 91.41, TOT NHAT trong moi lan thu.
-  - v4 (2D spatial embedding 1024 bucket + length-conditional gate):
-    F1 GIAM con 90.08. Nghi ngo qua nhieu tham so moi (~1.6M) tren 149
-    van ban train.
-  - v5 (co lap 2 thay doi, giam bucket con 32): CA HAI VAN GIAM rieng le
-    (spatial-only: 91.20, length-gate-only: 90.99), cong lai giam manh
-    hon (90.56). Debug print xac nhan: voi threshold=7 (hieu chinh tu case
-    study), sigmoid(length) BAO HOA GAN 0 cho ~90% segment (FUNSD da so
-    dai 1-6 tu) -> gan nhu khong co gradient huu ich, threshold/slope gan
-    nhu dung yen suot 1000 step (6.98->6.87). Ket luan: length-conditional
-    gate SAI VE BAN CHAT co che (khong phai sai so, ma sigmoid tren 1 dac
-    trung vo huong khong phu hop voi phan phoi lech cua FUNSD).
-  - v6 (BAN NAY): quay ve nen v3 (da kiem chung tot nhat), BO HAN length-
-    conditional gate. Thay vao do, THEM 1 co che MOI o vi tri KHAC: GRUGate
-    -- residual connection giua per-token hidden GOC va pooled_hidden (sau
-    segment pooling + Transformer context), dua tren GTrXL (Parisotto et
-    al., ICML 2020, "Stabilizing Transformers for Reinforcement Learning").
-    Khac biet cot loi: gate la VECTOR H-chieu hoc TU NOI DUNG bieu dien
-    (ca x va y), khong phai 1 scalar/1 dac trung be mat (do dai) nhu truoc
-    -- tranh dung loi bao hoa da gap. Thu gon bang bottleneck (kieu
-    Adapter, Houlsby et al. 2019) de kiem soat so tham so moi.
-    Dong thoi GIAI QUYET dung van de goc: doc file document 17 (ban goc)
-    cho thay KHONG HE co residual ve per_token_hidden -- pooling luon bi
-    AP DAT CUNG NHUC bat ke co loi hay khong, ke ca voi GOLD segmentation
-    (case study 42 sua/38 sai xac nhan dieu nay). GRUGate cho phep model
-    TU QUYET DINH moi token co nen tin pooled_hidden hay khong, dua tren
-    noi dung thuc te, thay vi ep buoc.
-"""
 import os
-
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
@@ -48,46 +12,8 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3PreTrainedModel,
 )
 
-
 def _is_main_process():
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
-
-
-class GRUGate(nn.Module):
-    """GRU-style gated residual connection (Parisotto et al., ICML 2020,
-    "Stabilizing Transformers for Reinforcement Learning" -- GTrXL). Thu
-    gon bang bottleneck (kieu Adapter, Houlsby et al. 2019) de kiem soat
-    so tham so moi tren tap du lieu nho (149 van ban).
-
-    QUAN TRONG: gate `z` la VECTOR H-chieu, tinh tu NOI DUNG thuc su cua
-    x (per-token hidden goc) va y (pooled_hidden sau segment context) --
-    khong phai 1 scalar, khong dua vao 1 dac trung be mat nhu do dai.
-    Day la diem khac biet cot loi so voi length-conditional gate da that
-    bai (xem lich su o dau file).
-    """
-
-    def __init__(self, hidden_size, bottleneck=64, bias_init=2.0):
-        super().__init__()
-        self.down_r = nn.Linear(hidden_size * 2, bottleneck, bias=False)
-        self.up_r = nn.Linear(bottleneck, hidden_size, bias=False)
-        self.down_z = nn.Linear(hidden_size * 2, bottleneck, bias=False)
-        self.up_z = nn.Linear(bottleneck, hidden_size, bias=False)
-        self.down_g = nn.Linear(hidden_size * 2, bottleneck, bias=False)
-        self.up_g = nn.Linear(bottleneck, hidden_size, bias=False)
-        # bias_init lon (~2) -> sigmoid(... - bg) ban dau GAN 0 -> z gan 0
-        # -> output gan bang x (per_token_hidden) -- AN TOAN luc khoi tao
-        # (giong tinh than token_gate=0 truoc day, nhung o day la per-dim,
-        # hoc duoc tu noi dung thay vi 1 scalar co dinh).
-        self.bg = nn.Parameter(torch.full((hidden_size,), bias_init))
-
-    def forward(self, x, y):
-        xy = torch.cat([x, y], dim=-1)
-        r = torch.sigmoid(self.up_r(self.down_r(xy)))
-        z = torch.sigmoid(self.up_z(self.down_z(xy)) - self.bg)
-        gated_input = torch.cat([r * x, y], dim=-1)
-        h_hat = torch.tanh(self.up_g(self.down_g(gated_input)))
-        return (1 - z) * x + z * h_hat
-
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -106,59 +32,75 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         seg_ctx_layers = getattr(config, "segment_context_layers", 1)
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
-        seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
-
+        
+        self.use_spatial_embed = getattr(config, "segment_use_spatial_embed", True)
+        self.use_length_gate = getattr(config, "segment_use_length_gate", True)
         self.debug_mode = getattr(config, "segment_debug", False)
         self._debug_printed = False
 
-        # ---- Nen v3 (da kiem chung tot nhat): order-based position embedding ----
         if seg_ctx_layers > 0:
+            # FIX OVERFITTING: Ép cứng dropout = 0.3 cho module mới thay vì 0.1 của backbone
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
                 nhead=seg_ctx_heads,
                 dim_feedforward=config.hidden_size * 2,
-                dropout=seg_ctx_dropout,
+                dropout=0.3, 
                 batch_first=True,
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
             self.segment_context_gate = nn.Parameter(torch.zeros(1))
 
-            max_pos = getattr(config, "segment_context_max_positions", 128)
-            self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
-            nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+            if not self.use_spatial_embed:
+                max_pos = getattr(config, "segment_context_max_positions", 128)
+                self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
+                nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+                self.segment_x_embedding = None
+                self.segment_y_embedding = None
+            else:
+                n_buckets = getattr(config, "segment_spatial_buckets", 32)
+                self.segment_x_embedding = nn.Embedding(n_buckets, config.hidden_size)
+                self.segment_y_embedding = nn.Embedding(n_buckets, config.hidden_size)
+                nn.init.normal_(self.segment_x_embedding.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.segment_y_embedding.weight, mean=0.0, std=0.02)
+                self._spatial_n_buckets = n_buckets
+                self.segment_position_embedding = None
         else:
             self.segment_context = None
             self.segment_context_gate = None
             self.segment_position_embedding = None
+            self.segment_x_embedding = None
+            self.segment_y_embedding = None
 
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
-        # ---- PATCH v6: GRUGate thay cho viec ap dat pooling vo dieu kien ----
-        self.use_token_gru_gate = getattr(config, "segment_use_token_gru_gate", True)
-        if seg_ctx_layers > 0 and self.use_token_gru_gate:
-            bottleneck = getattr(config, "segment_gate_bottleneck", 64)
-            self.token_gru_gate = GRUGate(config.hidden_size, bottleneck=bottleneck)
+        if seg_ctx_layers > 0 and self.use_length_gate:
+            self.seg_len_gate_threshold = nn.Parameter(torch.tensor(7.0))
+            self.seg_len_gate_slope = nn.Parameter(torch.tensor(1.0))
         else:
-            self.token_gru_gate = None
+            self.seg_len_gate_threshold = None
+            self.seg_len_gate_slope = None
 
-        # None | "order" | "membership" -- giu lai hook cho T4/T5-style
-        # ablation neu can dung lai, khong anh huong hanh vi mac dinh.
         self.eval_shuffle_mode = None
-
         self.init_weights()
 
         if _is_main_process():
-            n_gru_params = sum(p.numel() for p in self.token_gru_gate.parameters()) if self.token_gru_gate else 0
             print(
-                f"[LayoutLMv3ForSegmentTokenClassification v6] segment_context_layers={seg_ctx_layers} "
-                f"use_token_gru_gate={self.use_token_gru_gate} (tham so GRUGate: {n_gru_params:,})"
+                f"[LayoutLMv3ForSegmentTokenClassification] segment_context_layers={seg_ctx_layers} "
+                f"use_spatial_embed={self.use_spatial_embed} use_length_gate={self.use_length_gate} "
+                f"spatial_buckets={getattr(config, 'segment_spatial_buckets', 32) if self.use_spatial_embed else None}"
             )
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
+    def _bbox_to_bucket(self, coord_0_1000):
+        idx = (coord_0_1000.clamp(0, 1000) / 1000.0 * (self._spatial_n_buckets - 1)).long()
+        return idx
+
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id, bbox):
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
+
+        debug_this_call = self.debug_mode and not self._debug_printed and _is_main_process()
 
         for b in range(B):
             ids = seg_id[b].clone()
@@ -177,11 +119,22 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
+            seg_lens = torch.zeros(n_seg, device=device, dtype=text_hidden.dtype)
+            seg_cx = torch.zeros(n_seg, device=device, dtype=torch.float32)
+            seg_cy = torch.zeros(n_seg, device=device, dtype=torch.float32)
             seg_masks = []
+            
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                seg_lens[i] = mask.sum().float()
+                if self.use_spatial_embed and bbox is not None:
+                    member_boxes = bbox[b, mask].float()
+                    cx = (member_boxes[:, 0] + member_boxes[:, 2]) / 2
+                    cy = (member_boxes[:, 1] + member_boxes[:, 3]) / 2
+                    seg_cx[i] = cx.mean()
+                    seg_cy[i] = cy.mean()
 
             order_perm = None
             if self.eval_shuffle_mode == "order" and not self.training and n_seg > 1:
@@ -191,9 +144,18 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_vecs_input = seg_vecs
 
             if self.segment_context is not None:
-                max_pos = self.segment_position_embedding.num_embeddings
-                positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
-                seg_vecs_with_pos = seg_vecs_input + self.segment_position_embedding(positions)
+                if self.use_spatial_embed:
+                    x_bucket = self._bbox_to_bucket(seg_cx)
+                    y_bucket = self._bbox_to_bucket(seg_cy)
+                    pos_embed = self.segment_x_embedding(x_bucket) + self.segment_y_embedding(y_bucket)
+                    if order_perm is not None:
+                        pos_embed = pos_embed[order_perm]
+                else:
+                    max_pos = self.segment_position_embedding.num_embeddings
+                    positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
+                    pos_embed = self.segment_position_embedding(positions)
+
+                seg_vecs_with_pos = seg_vecs_input + pos_embed
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
 
                 if order_perm is not None:
@@ -201,7 +163,35 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     inv_perm[order_perm] = torch.arange(n_seg, device=device)
                     ctx_out = ctx_out[inv_perm]
 
-                seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
+                if self.use_length_gate:
+                    length_factor = torch.sigmoid(
+                        (seg_lens - self.seg_len_gate_threshold)
+                        * torch.clamp(self.seg_len_gate_slope, min=0.05, max=2.0)
+                    )
+                    effective_gate = self.segment_context_gate * length_factor.unsqueeze(-1)
+                else:
+                    effective_gate = self.segment_context_gate
+
+                seg_vecs_ctx = seg_vecs + effective_gate * (ctx_out - seg_vecs)
+
+                if debug_this_call and b == 0:
+                    print("=" * 60)
+                    print("[DEBUG segment_pool] batch0, n_seg =", n_seg)
+                    print("  seg_lens        :", seg_lens.tolist()[:10], "...")
+                    if self.use_spatial_embed:
+                        print("  seg_cx (0-1000) :", seg_cx.tolist()[:10], "...")
+                        print("  seg_cy (0-1000) :", seg_cy.tolist()[:10], "...")
+                        print("  x_bucket        :", x_bucket.tolist()[:10], "...")
+                        print("  y_bucket        :", y_bucket.tolist()[:10], "...")
+                    if self.use_length_gate:
+                        print("  threshold =", self.seg_len_gate_threshold.item(),
+                              " slope =", self.seg_len_gate_slope.item())
+                        print("  length_factor   :", length_factor.tolist()[:10], "...")
+                    print("  segment_context_gate =", self.segment_context_gate.item())
+                    print("  ||ctx_out - seg_vecs|| / ||seg_vecs|| =",
+                          ((ctx_out - seg_vecs).norm() / (seg_vecs.norm() + 1e-9)).item())
+                    print("=" * 60)
+                    self._debug_printed = True
             else:
                 seg_vecs_ctx = seg_vecs
 
@@ -250,8 +240,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         image_hidden = sequence_output[:, text_len:, :]
 
         if seg_id is not None:
-            per_token_hidden = text_hidden
-            pooled_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            bbox_text = bbox[:, :text_len, :] if bbox is not None else None
+            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, bbox_text)
 
             is_first = torch.zeros_like(seg_id, dtype=torch.long)
             is_first[:, 0] = 0
@@ -262,28 +252,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 is_first[:, 1:] = changed.long()
             is_first = is_first * (seg_id >= 0).long()
 
-            valid_mask = (seg_id >= 0).unsqueeze(-1).to(pooled_hidden.dtype)
-            pooled_hidden = pooled_hidden + self.is_first_token_embedding(is_first) * valid_mask
-
-            # ---- PATCH v6: GRUGate thay vi ghi de vo dieu kien ----
-            if self.token_gru_gate is not None:
-                text_hidden = self.token_gru_gate(per_token_hidden, pooled_hidden)
-
-                if self.debug_mode and not self._debug_printed and _is_main_process():
-                    with torch.no_grad():
-                        diff_norm = (pooled_hidden - per_token_hidden).norm(dim=-1)
-                        out_diff_norm = (text_hidden - per_token_hidden).norm(dim=-1)
-                        ratio = (out_diff_norm / (diff_norm + 1e-9)).mean().item()
-                    print("=" * 60)
-                    print("[DEBUG GRUGate] batch0:")
-                    print(f"  ||pooled - per_token|| mean = {diff_norm.mean().item():.4f}")
-                    print(f"  ||output - per_token|| mean = {out_diff_norm.mean().item():.4f}")
-                    print(f"  ty le output di chuyen ve phia pooled = {ratio:.4f} "
-                          f"(0=giu nguyen per_token, 1=dung het pooled)")
-                    print("=" * 60)
-                    self._debug_printed = True
-            else:
-                text_hidden = pooled_hidden
+            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
 
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
