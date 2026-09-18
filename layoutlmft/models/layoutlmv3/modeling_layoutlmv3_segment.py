@@ -25,6 +25,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         self.layoutlmv3 = LayoutLMv3Model(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
         if config.num_labels < 10:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
@@ -35,7 +36,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.use_xy_cut = getattr(config, "segment_use_xy_cut", False)
 
         if seg_ctx_layers > 0:
-            # Ép cứng dropout = 0.3 cho module Context để chống Overfitting
+            # Dropout 0.3 để chống overfitting trên tập nhỏ (FUNSD/CORD)
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
                 nhead=seg_ctx_heads,
@@ -60,63 +61,66 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.init_weights()
 
         if _is_main_process():
-            print(f"[LayoutLMv3ForSegmentTokenClassification] Layers={seg_ctx_layers} | Overlap-XY-Cut={self.use_xy_cut}")
+            print(f"[LayoutLMv3ForSegmentTokenClassification] Layers={seg_ctx_layers} | Recursive XY-Cut={self.use_xy_cut}")
 
     def _get_xy_cut_order(self, boxes):
         """
-        Heuristic Overlap-based Sort: 
-        1. Sắp xếp thô từ trên xuống dưới (theo Y_min).
-        2. Nhóm các cụm vào chung một dòng nếu độ giao nhau dọc (Vertical Overlap) > 50%.
-        3. Trong mỗi dòng, sắp xếp lại từ trái qua phải (theo X_min).
+        True Recursive XY-Cut: Projection Profile để phân tích Layout đa cột.
+        Tìm khoảng trắng ngang/dọc lớn nhất để chia tài liệu thành các block, đệ quy.
         """
         N = boxes.shape[0]
         if N <= 1:
             return torch.arange(N, device=boxes.device)
-        
-        y_min = boxes[:, 1]
-        y_max = boxes[:, 3]
-        x_min = boxes[:, 0]
-        
-        initial_order = torch.argsort(y_min)
-        sorted_ymin = y_min[initial_order]
-        sorted_ymax = y_max[initial_order]
-        sorted_xmin = x_min[initial_order]
-        
-        lines = []
-        current_line = [0]
-        current_line_ymin = sorted_ymin[0].item()
-        current_line_ymax = sorted_ymax[0].item()
-        
-        for i in range(1, N):
-            box_ymin = sorted_ymin[i].item()
-            box_ymax = sorted_ymax[i].item()
             
-            overlap = max(0.0, min(current_line_ymax, box_ymax) - max(current_line_ymin, box_ymin))
-            box_height = box_ymax - box_ymin
-            
-            if box_height > 0 and (overlap / box_height) > 0.5:
-                current_line.append(i)
-                current_line_ymin = min(current_line_ymin, box_ymin)
-                current_line_ymax = max(current_line_ymax, box_ymax)
-            else:
-                lines.append(current_line)
-                current_line = [i]
-                current_line_ymin = box_ymin
-                current_line_ymax = box_ymax
+        boxes_list = [(i, boxes[i].tolist()) for i in range(N)]
         
-        if current_line:
-            lines.append(current_line)
-            
-        final_order = []
-        for line in lines:
-            if len(line) > 1:
-                line_tensor = torch.tensor(line, device=boxes.device)
-                line_xmin = sorted_xmin[line_tensor]
-                x_order = torch.argsort(line_xmin)
-                final_order.extend(initial_order[line_tensor[x_order]].tolist())
-            else:
-                final_order.append(initial_order[line[0]].item())
+        def recursive_cut(items):
+            if len(items) <= 1:
+                return [idx for idx, _ in items]
                 
+            items_x = sorted(items, key=lambda b: b[1][0])
+            items_y = sorted(items, key=lambda b: b[1][1])
+            
+            # Quét X tìm khe hở dọc (chia cột)
+            max_x_gap = -float('inf')
+            x_cut_idx = -1
+            current_max_x = items_x[0][1][2]
+            
+            for i in range(1, len(items_x)):
+                gap = items_x[i][1][0] - current_max_x
+                if gap > max_x_gap:
+                    max_x_gap = gap
+                    x_cut_idx = i
+                current_max_x = max(current_max_x, items_x[i][1][2])
+                
+            # Quét Y tìm khe hở ngang (chia đoạn/header)
+            max_y_gap = -float('inf')
+            y_cut_idx = -1
+            current_max_y = items_y[0][1][3]
+            
+            for i in range(1, len(items_y)):
+                gap = items_y[i][1][1] - current_max_y
+                if gap > max_y_gap:
+                    max_y_gap = gap
+                    y_cut_idx = i
+                current_max_y = max(current_max_y, items_y[i][1][3])
+                
+            # Base case: Box chồng chéo nhau, không có khe hở
+            if max_x_gap <= 0.0 and max_y_gap <= 0.0:
+                items_fallback = sorted(items, key=lambda b: ((b[1][1] + b[1][3])/2.0, b[1][0]))
+                return [idx for idx, _ in items_fallback]
+                
+            # Ưu tiên cắt theo khoảng hở lớn hơn
+            if max_y_gap >= max_x_gap:
+                top_half = items_y[:y_cut_idx]
+                bottom_half = items_y[y_cut_idx:]
+                return recursive_cut(top_half) + recursive_cut(bottom_half)
+            else:
+                left_half = items_x[:x_cut_idx]
+                right_half = items_x[x_cut_idx:]
+                return recursive_cut(left_half) + recursive_cut(right_half)
+
+        final_order = recursive_cut(boxes_list)
         return torch.tensor(final_order, device=boxes.device)
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id, bbox):
@@ -163,11 +167,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_vecs_with_pos = seg_vecs_input + pos_embed
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
 
+                # Chuyển ngược lại thứ tự ban đầu sau khi đã lấy context
                 if order_perm is not None:
                     inv_perm = torch.empty_like(order_perm)
                     inv_perm[order_perm] = torch.arange(n_seg, device=device)
                     ctx_out = ctx_out[inv_perm]
 
+                # Tích hợp ngữ cảnh bằng Scalar Gate
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
                 seg_vecs_ctx = seg_vecs
