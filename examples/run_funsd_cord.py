@@ -66,10 +66,10 @@ class DataTrainingArguments:
     
     segment_use_xy_cut: bool = field(
         default=False, 
-        metadata={"help": "Bật/tắt Heuristic Overlap-based Sort (XY-Cut) cho Reading Order."}
+        metadata={"help": "Bật thuật toán Recursive XY-Cut để trích xuất Reading Order."}
     )
     new_params_lr: float = field(
-        default=2e-4, 
+        default=5e-4, 
         metadata={"help": "Learning rate cho module Context."}
     )
 
@@ -364,7 +364,7 @@ def main():
                 backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
                 new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
 
-                lr_new = getattr(self.args, "new_params_lr", 2e-4)
+                lr_new = getattr(self.args, "new_params_lr", 5e-4)
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate},
