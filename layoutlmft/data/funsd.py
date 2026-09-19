@@ -56,6 +56,7 @@ class Funsd(datasets.GeneratorBasedBuilder):
                     "id": datasets.Value("string"),
                     "tokens": datasets.Sequence(datasets.Value("string")),
                     "bboxes": datasets.Sequence(datasets.Sequence(datasets.Value("int64"))),
+                    "word_boxes": datasets.Sequence(datasets.Sequence(datasets.Value("int64"))),  # NEW
                     "ner_tags": datasets.Sequence(
                         datasets.features.ClassLabel(
                             names=["O", "B-HEADER", "I-HEADER", "B-QUESTION", "I-QUESTION", "B-ANSWER", "I-ANSWER"]
@@ -99,6 +100,7 @@ class Funsd(datasets.GeneratorBasedBuilder):
         for guid, file in enumerate(sorted(os.listdir(ann_dir))):
             tokens = []
             bboxes = []
+            word_boxes = []  
             ner_tags = []
 
             file_path = os.path.join(ann_dir, file)
@@ -109,6 +111,7 @@ class Funsd(datasets.GeneratorBasedBuilder):
             image, size = load_image(image_path)
             for item in data["form"]:
                 cur_line_bboxes = []
+                cur_word_boxes = []  # NEW
                 words, label = item["words"], item["label"]
                 words = [w for w in words if w["text"].strip() != ""]
                 if len(words) == 0:
@@ -118,19 +121,30 @@ class Funsd(datasets.GeneratorBasedBuilder):
                         tokens.append(w["text"])
                         ner_tags.append("O")
                         cur_line_bboxes.append(normalize_bbox(w["box"], size))
+                        cur_word_boxes.append(normalize_bbox(w["box"], size))  # NEW
                 else:
                     tokens.append(words[0]["text"])
                     ner_tags.append("B-" + label.upper())
                     cur_line_bboxes.append(normalize_bbox(words[0]["box"], size))
+                    cur_word_boxes.append(normalize_bbox(words[0]["box"], size))  # NEW
                     for w in words[1:]:
                         tokens.append(w["text"])
                         ner_tags.append("I-" + label.upper())
                         cur_line_bboxes.append(normalize_bbox(w["box"], size))
+                        cur_word_boxes.append(normalize_bbox(w["box"], size))  # NEW
                 # by default: --segment_level_layout 1
                 # if do not want to use segment_level_layout, comment the following line
                 cur_line_bboxes = self.get_line_bbox(cur_line_bboxes)
                 # box = normalize_bbox(item["box"], size)
                 # cur_line_bboxes = [box for _ in range(len(words))]
                 bboxes.extend(cur_line_bboxes)
-            yield guid, {"id": str(guid), "tokens": tokens, "bboxes": bboxes, "ner_tags": ner_tags,
-                         "image": image, "image_path": image_path}
+                word_boxes.extend(cur_word_boxes)  # NEW
+            yield guid, {
+                "id": str(guid),
+                "tokens": tokens,
+                "bboxes": bboxes,
+                "word_boxes": word_boxes,
+                "ner_tags": ner_tags,
+                "image": image,
+                "image_path": image_path,
+            }
