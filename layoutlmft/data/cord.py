@@ -80,6 +80,7 @@ class Cord(datasets.GeneratorBasedBuilder):
                     "id": datasets.Value("string"),
                     "words": datasets.Sequence(datasets.Value("string")),
                     "bboxes": datasets.Sequence(datasets.Sequence(datasets.Value("int64"))),
+                    "word_boxes": datasets.Sequence(datasets.Sequence(datasets.Value("int64"))),
                     "ner_tags": datasets.Sequence(
                         datasets.features.ClassLabel(
                             names=["O","B-MENU.NM","B-MENU.NUM","B-MENU.UNITPRICE","B-MENU.CNT","B-MENU.DISCOUNTPRICE","B-MENU.PRICE","B-MENU.ITEMSUBTOTAL","B-MENU.VATYN","B-MENU.ETC","B-MENU.SUB_NM","B-MENU.SUB_UNITPRICE","B-MENU.SUB_CNT","B-MENU.SUB_PRICE","B-MENU.SUB_ETC","B-VOID_MENU.NM","B-VOID_MENU.PRICE","B-SUB_TOTAL.SUBTOTAL_PRICE","B-SUB_TOTAL.DISCOUNT_PRICE","B-SUB_TOTAL.SERVICE_PRICE","B-SUB_TOTAL.OTHERSVC_PRICE","B-SUB_TOTAL.TAX_PRICE","B-SUB_TOTAL.ETC","B-TOTAL.TOTAL_PRICE","B-TOTAL.TOTAL_ETC","B-TOTAL.CASHPRICE","B-TOTAL.CHANGEPRICE","B-TOTAL.CREDITCARDPRICE","B-TOTAL.EMONEYPRICE","B-TOTAL.MENUTYPE_CNT","B-TOTAL.MENUQTY_CNT","I-MENU.NM","I-MENU.NUM","I-MENU.UNITPRICE","I-MENU.CNT","I-MENU.DISCOUNTPRICE","I-MENU.PRICE","I-MENU.ITEMSUBTOTAL","I-MENU.VATYN","I-MENU.ETC","I-MENU.SUB_NM","I-MENU.SUB_UNITPRICE","I-MENU.SUB_CNT","I-MENU.SUB_PRICE","I-MENU.SUB_ETC","I-VOID_MENU.NM","I-VOID_MENU.PRICE","I-SUB_TOTAL.SUBTOTAL_PRICE","I-SUB_TOTAL.DISCOUNT_PRICE","I-SUB_TOTAL.SERVICE_PRICE","I-SUB_TOTAL.OTHERSVC_PRICE","I-SUB_TOTAL.TAX_PRICE","I-SUB_TOTAL.ETC","I-TOTAL.TOTAL_PRICE","I-TOTAL.TOTAL_ETC","I-TOTAL.CASHPRICE","I-TOTAL.CHANGEPRICE","I-TOTAL.CREDITCARDPRICE","I-TOTAL.EMONEYPRICE","I-TOTAL.MENUTYPE_CNT","I-TOTAL.MENUQTY_CNT"]
@@ -152,6 +153,7 @@ class Cord(datasets.GeneratorBasedBuilder):
         for guid, file in enumerate(sorted(os.listdir(ann_dir))):
             words = []
             bboxes = []
+            word_boxes = []
             ner_tags = []
             file_path = os.path.join(ann_dir, file)
             with open(file_path, "r", encoding="utf8") as f:
@@ -167,21 +169,27 @@ class Cord(datasets.GeneratorBasedBuilder):
                     continue
                 if label == "other":
                     for w in line_words:
+                        box = normalize_bbox(quad_to_box(w["quad"]), size)
                         words.append(w["text"])
                         ner_tags.append("O")
-                        cur_line_bboxes.append(normalize_bbox(quad_to_box(w["quad"]), size))
+                        cur_line_bboxes.append(box)
+                        word_boxes.append(box)
                 else:
+                    box = normalize_bbox(quad_to_box(line_words[0]["quad"]), size)
                     words.append(line_words[0]["text"])
                     ner_tags.append("B-" + label.upper())
-                    cur_line_bboxes.append(normalize_bbox(quad_to_box(line_words[0]["quad"]), size))
+                    cur_line_bboxes.append(box)
+                    word_boxes.append(box)
                     for w in line_words[1:]:
+                        box = normalize_bbox(quad_to_box(w["quad"]), size)
                         words.append(w["text"])
                         ner_tags.append("I-" + label.upper())
-                        cur_line_bboxes.append(normalize_bbox(quad_to_box(w["quad"]), size))
+                        cur_line_bboxes.append(box)
+                        word_boxes.append(box)
                 # by default: --segment_level_layout 1
                 # if do not want to use segment_level_layout, comment the following line
                 cur_line_bboxes = self.get_line_bbox(cur_line_bboxes)
                 bboxes.extend(cur_line_bboxes)
             # yield guid, {"id": str(guid), "words": words, "bboxes": bboxes, "ner_tags": ner_tags, "image": image}
-            yield guid, {"id": str(guid), "words": words, "bboxes": bboxes, "ner_tags": ner_tags,
+            yield guid, {"id": str(guid), "words": words, "bboxes": bboxes, "word_boxes": word_boxes, "ner_tags": ner_tags,
                          "image": image, "image_path": image_path}
