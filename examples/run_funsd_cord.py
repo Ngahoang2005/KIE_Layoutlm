@@ -153,6 +153,10 @@ class DataTrainingArguments:
     segment_context_layers: int = field(default=1)
     segment_context_heads: int = field(default=4)
     segment_context_dropout: float = field(default=0.1)
+    validation_split_ratio: float = field(
+        default=0.0,
+        metadata={"help": "When a dataset has no validation split, reserve this fraction of train for tuning."},
+    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -223,6 +227,16 @@ def main():
         datasets = load_dataset(os.path.abspath(layoutlmft.data.cord.__file__), cache_dir=model_args.cache_dir)
     else:
         raise NotImplementedError()
+
+    # FUNSD has only train/test.  A reproducible hold-out prevents selecting
+    # hyperparameters on its test set; CORD already supplies validation.
+    if (data_args.validation_split_ratio > 0 and "validation" not in datasets):
+        if not 0 < data_args.validation_split_ratio < 1:
+            raise ValueError("--validation_split_ratio must be in (0, 1)")
+        split = datasets["train"].train_test_split(
+            test_size=data_args.validation_split_ratio, seed=training_args.seed)
+        datasets["train"] = split["train"]
+        datasets["validation"] = split["test"]
 
     if training_args.do_train:
         column_names = datasets["train"].column_names
