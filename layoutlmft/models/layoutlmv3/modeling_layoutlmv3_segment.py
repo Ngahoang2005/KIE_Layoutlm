@@ -73,10 +73,12 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             max_pos = getattr(config, "segment_context_max_positions", 128)
             self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
             nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+            self.segment_geometry_projection = nn.Linear(4, config.hidden_size)
         else:
             self.segment_context = None
             self.segment_context_gate = None
             self.segment_position_embedding = None
+            self.segment_geometry_projection = None
 
         # Small embedding so the classifier can still tell "first token of the
         # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
@@ -85,12 +87,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         # unmodified baseline.
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        # Keeps the initial model close to the token baseline while allowing
+        # the context module to learn a non-destructive residual correction.
+        self.segment_fusion_gate = nn.Parameter(
+            torch.tensor(float(getattr(config, "segment_fusion_init", 0.1))))
 
         self.init_weights()
         # for param in self.layoutlmv3.parameters():
         #     param.requires_grad = False
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id, seg_bbox=None):
         """
         text_hidden: (B, L, H) hidden states for the TEXT part only
                      (image-patch positions, if any, are handled separately
@@ -110,6 +116,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
+        broadcast_base = text_hidden.clone()
 
         for b in range(B):
             ids = seg_id[b]
@@ -121,16 +128,21 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
+            seg_geometry = torch.zeros(n_seg, 4, device=device, dtype=text_hidden.dtype)
             seg_masks = []
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                if seg_bbox is not None:
+                    seg_geometry[i] = seg_bbox[b, mask][0].to(text_hidden.dtype) / 1000.0
 
             if self.segment_context is not None:
                 max_pos = self.segment_position_embedding.num_embeddings
                 positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
                 seg_vecs_with_pos = seg_vecs + self.segment_position_embedding(positions)
+                if seg_bbox is not None:
+                    seg_vecs_with_pos = seg_vecs_with_pos + self.segment_geometry_projection(seg_geometry)
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
@@ -138,8 +150,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
             for i, mask in enumerate(seg_masks):
                 broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+                broadcast_base[b, mask] = seg_vecs[i]
 
-        return broadcast_hidden
+        return broadcast_hidden, broadcast_base
 
     def forward(
         self,
@@ -153,6 +166,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         inputs_embeds=None,
         labels=None,
         seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        seg_bbox=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -181,7 +195,12 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         image_hidden = sequence_output[:, text_len:, :]
 
         if seg_id is not None:
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            contextual_segments, pooled_segments = self._segment_pool_and_contextualize(
+                text_hidden, seg_id, seg_bbox)
+            # Only inject inter-segment information. Replacing token features
+            # with a pooled line vector was the failure mode on dense receipts.
+            text_hidden = text_hidden + self.segment_fusion_gate * (
+                contextual_segments - pooled_segments)
 
             # Add the is-first-token-of-segment signal so the classifier can
             # still distinguish B- from I- despite the shared pooled vector.
