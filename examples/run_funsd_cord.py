@@ -148,6 +148,11 @@ class DataTrainingArguments:
             "inter-segment context head) instead of the vanilla per-token classification head."
         },
     )
+    segment_head_learning_rate: float = field(default=5e-4)
+    segment_fusion_init: float = field(default=0.1)
+    segment_context_layers: int = field(default=1)
+    segment_context_heads: int = field(default=4)
+    segment_context_dropout: float = field(default=0.1)
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -267,6 +272,10 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    config.segment_fusion_init = data_args.segment_fusion_init
+    config.segment_context_layers = data_args.segment_context_layers
+    config.segment_context_heads = data_args.segment_context_heads
+    config.segment_context_dropout = data_args.segment_context_dropout
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
@@ -345,12 +354,19 @@ def main():
         bboxes = []
         images = []
         seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        seg_bboxes = []  # line boxes used only by the segment-context head
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
 
             label = examples[label_column_name][org_batch_index]
-            bbox = examples["bboxes"][org_batch_index]
+            line_bbox = examples["bboxes"][org_batch_index]
+            # CORD fields in the same annotated line often occupy different
+            # columns. Preserve their word geometry in the backbone while
+            # retaining the line geometry below for segment context.
+            bbox = (examples["word_boxes"][org_batch_index]
+                    if data_args.dataset_name == "cord" and "word_boxes" in examples
+                    else line_bbox)
 
             # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
             # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
@@ -366,7 +382,7 @@ def main():
                 word_seg_id = []
                 seg_counter = -1
                 prev_bbox_tuple = None
-                for wb in bbox:
+                for wb in line_bbox:
                     wb_tuple = tuple(wb)
                     if wb_tuple != prev_bbox_tuple:
                         seg_counter += 1
@@ -377,6 +393,7 @@ def main():
             label_ids = []
             bbox_inputs = []
             seg_id_inputs = []  # NEW
+            seg_bbox_inputs = []
             for word_idx in word_ids:
                 # Special tokens have a word id that is None. We set the label to -100 so they are automatically
                 # ignored in the loss function.
@@ -385,12 +402,14 @@ def main():
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
                         seg_id_inputs.append(-1)  # NEW: not part of any segment
+                        seg_bbox_inputs.append([0, 0, 0, 0])
                 # We set the label for the first token of each word.
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                        seg_bbox_inputs.append(line_bbox[word_idx])
                 # For the other tokens in a word, we set the label to either the current label or -100, depending on
                 # the label_all_tokens flag.
                 else:
@@ -398,11 +417,13 @@ def main():
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                        seg_bbox_inputs.append(line_bbox[word_idx])
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
                 seg_ids.append(seg_id_inputs)  # NEW
+                seg_bboxes.append(seg_bbox_inputs)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -415,6 +436,7 @@ def main():
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids  # NEW
+            tokenized_inputs["seg_bbox"] = seg_bboxes
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -435,7 +457,9 @@ def main():
         )
 
     if training_args.do_eval:
-        validation_name = "test"
+        # CORD provides a labelled dev split: tune only there. FUNSD has no
+        # validation split, so its conventional labelled test split remains.
+        validation_name = "validation" if "validation" in datasets else "test"
         if validation_name not in datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = datasets[validation_name]
@@ -518,7 +542,7 @@ def main():
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": new_params, "lr": data_args.segment_head_learning_rate}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
