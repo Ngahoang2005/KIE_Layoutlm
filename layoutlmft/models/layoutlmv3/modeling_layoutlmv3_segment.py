@@ -106,7 +106,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_context = None
             self.segment_position_embedding = None
             self.segment_residual_proj = None
-
+        # --- THÊM ĐOẠN NÀY ĐỂ BÁO HIỆU TOKEN ĐẦU TIÊN CỦA TỪ ---
+        self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
+        nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        # -------------------------------------------------------
         self.init_weights()
 
     def _segment_residual(self, text_hidden, seg_id):
@@ -188,6 +191,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_len = input_ids.shape[1]
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
+        # --- THÊM ĐOẠN NÀY ĐỂ CỘNG EMBEDDING VÀO TOKEN ---
+        if valid_span is not None:
+            # valid_span có dạng 0 (không phải subword đầu) và 1 (là subword đầu)
+            valid_span_tensor = valid_span.long().to(text_hidden.device)
+            first_token_emb = self.is_first_token_embedding(valid_span_tensor)
+            text_hidden = text_hidden + first_token_emb
+        # -------------------------------------------------
 
         if seg_id is not None and self.segment_context is not None:
             text_hidden = self._segment_residual(text_hidden, seg_id)
