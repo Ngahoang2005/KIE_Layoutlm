@@ -37,6 +37,16 @@ class LayoutLMv3Config(BertConfig):
         input_size=224,
         second_input_size=112,
         device='cuda',
+        use_hierarchical_position_encoding: bool = False,
+        max_line_position: int = 50,
+        max_block_position: int = 20,
+        use_column_encoding: bool = False,
+        max_column_position: int = 10,
+        use_intra_line_boundary: bool = False,
+        lambda_bound_init: float = 0.1,
+        use_semantic_geometry_disentangle: bool = False,
+        lambda_geo_init: float = 0.1,
+        lambda_orth_init: float = 0.1,
         **kwargs
     ):
         """Constructs RobertaConfig."""
@@ -58,3 +68,13 @@ class LayoutLMv3Config(BertConfig):
         self.input_size = input_size
         self.second_input_size = second_input_size
         self.device = device
+        self.use_hierarchical_position_encoding = use_hierarchical_position_encoding
+        self.max_line_position = max_line_position
+        self.max_block_position = max_block_position
+        self.use_column_encoding = use_column_encoding
+        self.max_column_position = max_column_position
+        self.use_intra_line_boundary = use_intra_line_boundary
+        self.lambda_bound_init = lambda_bound_init
+        self.use_semantic_geometry_disentangle = use_semantic_geometry_disentangle
+        self.lambda_geo_init = lambda_geo_init
+        self.lambda_orth_init = lambda_orth_init
