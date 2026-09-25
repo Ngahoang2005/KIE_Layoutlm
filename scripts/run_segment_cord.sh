@@ -2,12 +2,6 @@
 
 set -e
 
-cd /home/s24gbn1/Documents/httn/unilm/layoutlmv3
-
-export PYTHONPATH="/home/s24gbn1/Documents/httn/unilm/layoutlmv3:$PYTHONPATH"
-export TOKENIZERS_PARALLELISM=false
-export WANDB_PROJECT="CORD-LISC-Experiment"
-
 SEEDS=(42 123 1993)
 
 for SEED in "${SEEDS[@]}"
